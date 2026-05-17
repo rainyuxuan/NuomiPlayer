@@ -1,5 +1,6 @@
 package com.nuomi.shared;
 import android.content.BroadcastReceiver;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -50,7 +51,7 @@ public class MyMusicService extends MediaBrowserServiceCompat {
 
     private int lastPlayMode = 0; // QQ 的播放模式缓存
 
-    // ===== 仅在“QQ 歌词模式”下使用的缓存/本地时钟 =====
+    // ===== 仅在"QQ 歌词模式"下使用的缓存/本地时钟 =====
     private MediaMetadataCompat lastRemoteMeta = null;
     private PlaybackStateCompat lastRemoteState = null;
 
@@ -65,7 +66,7 @@ public class MyMusicService extends MediaBrowserServiceCompat {
 
     private String lastLyricsRaw = null;
 
-    // 新增：当前是否处于“网易云模式”
+    // 新增：当前是否处于"网易云模式"
     private boolean isNcmMode = false;  // false=QQ 模式；true=非QQ（任意播放器）模式
 
     // 新增：防止重复激活
@@ -75,10 +76,12 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     private static final String TAG = "Mirror";
 
     private void updateSessionActive(String reason) {
-        boolean should = (!isNcmMode && isLyricsMode); // 只有 QQ + 歌词模式 才激活
-        if (mSession.isActive() != should) {
-            mSession.setActive(should);
-            Log.i(TAG, "setActive=" + should + " reason=" + reason);
+        // session 只要 service 在运行就保持 active，让 AA 始终能发现此应用。
+        // AA 通过 metadata/playbackState 内容判断是否有可用媒体，不依赖 isActive() 来决定显示。
+        // 原条件 (!isNcmMode && isLyricsMode) 导致 session 几乎永远 inactive，AA 看不见 app。
+        if (!mSession.isActive()) {
+            mSession.setActive(true);
+            Log.i(TAG, "setActive=true reason=" + reason);
         }
     }
 
@@ -98,7 +101,7 @@ public class MyMusicService extends MediaBrowserServiceCompat {
 
 
 
-    // 以“基准位置+基准时间+速度”推算当前 position（只在 QQ 歌词模式用）
+    // 以"基准位置+基准时间+速度"推算当前 position（只在 QQ 歌词模式用）
     private long clockPosition() {
         if (baseState == PlaybackStateCompat.STATE_PLAYING) {
             long elapsed = SystemClock.elapsedRealtime() - baseUpdateElapsed;
@@ -120,7 +123,7 @@ public class MyMusicService extends MediaBrowserServiceCompat {
         }
     };
 
-    // “自动开启歌词模式”广播，仅 QQ 模式生效
+    // "自动开启歌词模式"广播，仅 QQ 模式生效
     private final BroadcastReceiver autoLyricsReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -173,7 +176,7 @@ public class MyMusicService extends MediaBrowserServiceCompat {
         // --- 1. 同步元数据 ---
         if (meta != null) {
             if (!isNcmMode && isLyricsMode) {
-                // QQ 歌词模式：覆盖为“当前句/下一句”
+                // QQ 歌词模式：覆盖为"当前句/下一句"
                 applyLyricsOverlay(meta);
             } else {
                 // QQ 非歌词模式 或 NCM 模式：原样映射标准字段
@@ -181,6 +184,14 @@ public class MyMusicService extends MediaBrowserServiceCompat {
 
                 String title = meta.getString(MediaMetadataCompat.METADATA_KEY_TITLE);
                 String artist = meta.getString(MediaMetadataCompat.METADATA_KEY_ARTIST);
+
+                // 持久化歌曲信息：下次冷启动时可立即展示给 AA，减少"无内容"窗口。
+                if (title != null) {
+                    getSharedPreferences("last_meta", MODE_PRIVATE).edit()
+                            .putString("title", title)
+                            .putString("artist", artist != null ? artist : "")
+                            .apply();
+                }
 
                 long duration = meta.getLong(MediaMetadataCompat.METADATA_KEY_DURATION);
 
@@ -196,7 +207,7 @@ public class MyMusicService extends MediaBrowserServiceCompat {
                 if (duration > 0)
                     builder.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, duration);
 
-                // ✅ 仅在“非 QQ 模式”启用封面位图兜底；QQ 模式保持你原来的只取 ALBUM_ART 行为
+                // ✅ 仅在"非 QQ 模式"启用封面位图兜底；QQ 模式保持你原来的只取 ALBUM_ART 行为
                 Bitmap art = null;
                 if (isNcmMode) {
                     // 非 QQ：位图优先顺序 ALBUM_ART → DISPLAY_ICON → ART
@@ -281,7 +292,7 @@ public class MyMusicService extends MediaBrowserServiceCompat {
                                     PlaybackStateCompat.ACTION_PLAY_PAUSE
                     );
 
-            // 仅 QQ 模式下加入自定义按钮；NCM 模式完全关闭“歌词/循环”按钮
+            // 仅 QQ 模式下加入自定义按钮；NCM 模式完全关闭"歌词/循环"按钮
             if (!isNcmMode) {
                 int lyricsIconRes = isLyricsMode ? R.drawable.ic_lyrics_24dp : R.drawable.ic_lyrics_outline_24dp;
                 builder.addCustomAction(new PlaybackStateCompat.CustomAction.Builder(
@@ -305,7 +316,7 @@ public class MyMusicService extends MediaBrowserServiceCompat {
         }
     }
 
-    // 仅在“QQ 歌词模式”调用：把当前/下一句覆盖到元数据
+    // 仅在"QQ 歌词模式"调用：把当前/下一句覆盖到元数据
     private void applyLyricsOverlay(MediaMetadataCompat meta) {
         if (isNcmMode || !isLyricsMode || meta == null) return;
 
@@ -388,7 +399,7 @@ public class MyMusicService extends MediaBrowserServiceCompat {
                 return;
             }
 
-            // 2) 只采纳“当前选中的包名”
+            // 2) 只采纳"当前选中的包名"
             SharedPreferences sp = getSharedPreferences("session_pref", MODE_PRIVATE);
             String chosenPkg = sp.getString("last_pkg", null);
             if (chosenPkg == null || !chosenPkg.equals(sourcePkg)) {
@@ -471,8 +482,20 @@ public class MyMusicService extends MediaBrowserServiceCompat {
         mSession.setFlags(MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS);
         setSessionToken(mSession.getSessionToken());
 
+        // 恢复上次播放的歌曲信息：让 AA 在真实 token 到来前就能看到有内容，
+        // 避免因初始 STATE_NONE + 无 metadata 而提前显示"无法获享媒体内容"。
+        SharedPreferences lastMeta = getSharedPreferences("last_meta", MODE_PRIVATE);
+        String savedTitle = lastMeta.getString("title", null);
+        String savedArtist = lastMeta.getString("artist", "");
+        if (savedTitle != null) {
+            mSession.setMetadata(new MediaMetadataCompat.Builder()
+                    .putString(MediaMetadataCompat.METADATA_KEY_TITLE, savedTitle)
+                    .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, savedArtist)
+                    .build());
+            Log.i(TAG, "🗃 已恢复上次播放信息: " + savedTitle);
+        }
         mSession.setPlaybackState(buildMinimalState(
-                PlaybackStateCompat.STATE_NONE, 0, 0f));
+                PlaybackStateCompat.STATE_PAUSED, 0, 0f));
         updateSessionActive("onCreate");
 
         mSession.setCallback(new MediaSessionCompat.Callback() {
@@ -574,7 +597,7 @@ public class MyMusicService extends MediaBrowserServiceCompat {
 
 
 
-        // 注册“自动歌词模式”广播
+        // 注册"自动歌词模式"广播
         lbm.registerReceiver(autoLyricsReceiver, new IntentFilter(ACTION_TOGGLE_LYRICS_MODE));
 
 
@@ -605,9 +628,15 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     // =========================================================
     @Override
     public void onDestroy() {
-        handler.removeCallbacks(lyricsUpdater);
+        // 取消所有 handler 上的待执行任务（重试 lambda、lyricsUpdater、clearSuppression 等），
+        // 避免服务销毁后 lambda 仍持有 MyMusicService.this 引用导致短暂内存泄漏。
+        handler.removeCallbacksAndMessages(null);
         if (remoteCtrl != null) {
             remoteCtrl.unregisterCallback(remoteCb);
+        }
+        if (autoStartBrowser != null) {
+            try { autoStartBrowser.disconnect(); } catch (Throwable ignore) {}
+            autoStartBrowser = null;
         }
         LocalBroadcastManager lbm = LocalBroadcastManager.getInstance(this);
         lbm.unregisterReceiver(tokenRx);
@@ -624,7 +653,99 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     public BrowserRoot onGetRoot(@NonNull String clientPackageName,
                                  int clientUid,
                                  Bundle rootHints) {
+        // AA 每次 bind（含重连）都会调此方法。
+        // 立即请求 Token，并安排三次重试，覆盖以下竞态：
+        //   • Sniffer 尚未完成 onListenerConnected（初次冷启动）
+        //   • 目标 App 还没打开（自动化脚本延迟启动 QQ 音乐）
+        // 每次重试前检查 remoteCtrl，已拿到 token 则跳过。
+        final LocalBroadcastManager lbm = LocalBroadcastManager.getInstance(this);
+        lbm.sendBroadcast(new Intent("com.nuomi.REQUEST_TOKEN"));
+
+        long[] retryDelaysMs = {1500L, 4000L, 9000L};
+        for (long d : retryDelaysMs) {
+            final long delay = d;
+            handler.postDelayed(() -> {
+                if (remoteCtrl == null) {
+                    Log.i(TAG, "🔁 重试请求 Token（delay=" + delay + "ms）");
+                    lbm.sendBroadcast(new Intent("com.nuomi.REQUEST_TOKEN"));
+                }
+            }, delay);
+        }
+
+        // 若当前没有 remoteCtrl，尝试在后台唤醒上次选中的媒体 App 并触发播放，
+        // 全程无 Activity、无前台界面，不影响手机当前屏幕。
+        if (remoteCtrl == null) {
+            autoStartLastApp();
+        }
+
         return new BrowserRoot("root", null);
+    }
+
+    // 用来连接目标 App 的 MediaBrowserService（仅后台 Service，无 UI）
+    private MediaBrowserCompat autoStartBrowser;
+
+    private void autoStartLastApp() {
+        String pkg = getSharedPreferences("session_pref", MODE_PRIVATE)
+                .getString("last_pkg", null);
+        if (pkg == null) {
+            Log.i(TAG, "autoStart: 未选中任何 App，跳过");
+            return;
+        }
+
+        // 查找目标 App 对外暴露的 MediaBrowserService 组件
+        Intent query = new Intent("android.media.browse.MediaBrowserService");
+        query.setPackage(pkg);
+        List<android.content.pm.ResolveInfo> services;
+        try {
+            services = getPackageManager().queryIntentServices(query, 0);
+        } catch (Exception e) {
+            Log.w(TAG, "autoStart: 查询服务失败 pkg=" + pkg, e);
+            return;
+        }
+        if (services == null || services.isEmpty()) {
+            Log.w(TAG, "autoStart: " + pkg + " 未暴露 MediaBrowserService，跳过");
+            return;
+        }
+
+        ComponentName cn = new ComponentName(
+                services.get(0).serviceInfo.packageName,
+                services.get(0).serviceInfo.name);
+        Log.i(TAG, "autoStart: 连接 " + cn.flattenToShortString());
+
+        if (autoStartBrowser != null) {
+            try { autoStartBrowser.disconnect(); } catch (Throwable ignore) {}
+            autoStartBrowser = null;
+        }
+
+        autoStartBrowser = new MediaBrowserCompat(this, cn,
+                new MediaBrowserCompat.ConnectionCallback() {
+                    @Override public void onConnected() {
+                        Log.i(TAG, "autoStart: 已连接，发送 play()");
+                        try {
+                            MediaControllerCompat ctrl = new MediaControllerCompat(
+                                    MyMusicService.this, autoStartBrowser.getSessionToken());
+                            ctrl.getTransportControls().play();
+                        } catch (Exception e) {
+                            Log.w(TAG, "autoStart: play() 失败", e);
+                        }
+                        // play() 触发后 Sniffer 会接管，3 秒后断开自动连接
+                        handler.postDelayed(() -> {
+                            if (autoStartBrowser != null) {
+                                autoStartBrowser.disconnect();
+                                autoStartBrowser = null;
+                            }
+                        }, 3000);
+                    }
+                    @Override public void onConnectionFailed() {
+                        Log.w(TAG, "autoStart: 连接失败 pkg=" + pkg);
+                        autoStartBrowser = null;
+                    }
+                    @Override public void onConnectionSuspended() {
+                        autoStartBrowser = null;
+                    }
+                }, null);
+
+        autoStartBrowser.connect();
     }
 
     @Override
