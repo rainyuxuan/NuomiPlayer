@@ -319,9 +319,8 @@ public class MainActivity extends AppCompatActivity {
             }
         };
 
-        IntentFilter filter = new IntentFilter(ACTION_CONTROLLER);
-        LocalBroadcastManager.getInstance(this).registerReceiver(tokenReceiver, filter);
-
+        // tokenReceiver 的注册挪到 onStart/onStop —— Activity 不在前台时不需要它更新 UI，
+        // 避免后台 broadcast 引发的 Fragment / Bitmap 处理浪费。
 
         // 6) 打开 App 按钮
 
@@ -355,14 +354,28 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onStart() {
+        super.onStart();
+        LocalBroadcastManager.getInstance(this)
+                .registerReceiver(tokenReceiver, new IntentFilter(ACTION_CONTROLLER));
+    }
+
+    @Override
+    protected void onStop() {
+        // 后台不再处理 token 广播；同步切断 controller 的回调避免后台位图更新
+        try { LocalBroadcastManager.getInstance(this).unregisterReceiver(tokenReceiver); } catch (Throwable ignore) {}
+        if (qqCtrl != null) {
+            qqCtrl.unregisterCallback(cb);
+            qqCtrl = null;
+        }
+        stopProgressTicker();
+        super.onStop();
+    }
+
+    @Override
     protected void onDestroy() {
-        if (qqCtrl != null) qqCtrl.unregisterCallback(cb);
-        LocalBroadcastManager.getInstance(this).unregisterReceiver(tokenReceiver);
-        progressHandler.removeCallbacksAndMessages(null);  // 停止进度更新
-
-
+        progressHandler.removeCallbacksAndMessages(null);
         LocalBroadcastManager.getInstance(this).unregisterReceiver(selectionChangedRx);
-
         super.onDestroy();
     }
 
@@ -499,11 +512,9 @@ public class MainActivity extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         refreshOpenButtonLabel(findViewById(R.id.btn_open_app));
-        // 关键路径：Bixby 把糯米拉到前台是用户用来"救场"的核心动作。
-        // 此时 AA 可能正在等 token，主动同时做三件事：
-        //   1. 让系统强行重绑 Sniffer（解决三星 NLS 长期未绑定的情况）
-        //   2. 立即广播一次 REQUEST_TOKEN（如果 Sniffer 已经活了，立即响应）
-        //   3. 锁屏后解锁、刚切到前台时，进程不会被电池策略卡住
+        // Activity 进入前台时主动唤起发现链路：
+        //   • requestRebind 触发系统重绑 NLS（处理 NLS 长期未绑定的情况）
+        //   • 广播 REQUEST_TOKEN，让已连接的 Sniffer 立即响应
         kickDiscovery();
     }
 

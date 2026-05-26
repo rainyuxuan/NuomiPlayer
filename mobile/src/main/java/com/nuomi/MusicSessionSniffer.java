@@ -96,7 +96,7 @@ public class MusicSessionSniffer extends NotificationListenerService {
         isListenerConnected = false;
         removeActiveSessionsListener();
         clearSelectedCallback();
-        // 主动请求系统尽快重绑，减少三星等激进省电机制下的重连延迟。
+        // 主动请求系统尽快重绑，减少省电策略下的重连延迟。
         try { requestRebind(selfComponent()); } catch (Throwable ignore) {}
         Log.i(TAG, "⚡ 已请求重绑通知监听服务");
         super.onListenerDisconnected();
@@ -143,10 +143,13 @@ public class MusicSessionSniffer extends NotificationListenerService {
             Log.w(TAG, "❌ 无法获取 MediaSessionManager");
             return null;
         }
-        List<MediaController> list = null;
-        try { list = sm.getActiveSessions(selfComponent()); } catch (SecurityException ignore) {}
-        if (list == null || list.isEmpty()) {
-            try { list = sm.getActiveSessions(null); } catch (Throwable ignore) {}
+        List<MediaController> list;
+        try {
+            list = sm.getActiveSessions(selfComponent());
+        } catch (SecurityException e) {
+            // 仅在 NLS 没绑定时出现；调用方已经按 isListenerConnected 守卫了，这里只是兜底
+            Log.w(TAG, "⚠️ getActiveSessions SecurityException: " + e.getMessage());
+            return null;
         }
         Log.i(TAG, "📊 活跃会话数量 = " + (list == null ? 0 : list.size()));
         if (list == null) return null;

@@ -43,6 +43,15 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    applicationVariants.all {
+        val variant = this
+        val suffix = if (variant.buildType.name == "release") "" else "-${variant.buildType.name}"
+        outputs.all {
+            (this as com.android.build.gradle.internal.api.BaseVariantOutputImpl)
+                .outputFileName = "NuomiPlayer$suffix.apk"
+        }
+    }
 }
 
 dependencies {

@@ -67,7 +67,8 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     private boolean isLyricsMode = false; // 仅 QQ 模式可用；NCM 模式强制关闭
     private final Handler handler = new Handler(Looper.getMainLooper());
 
-    private int lastPlayMode = 0; // QQ 的播放模式缓存
+    private int lastPlayMode = 2; // QQ 播放模式缓存：默认 repeat-all（避免初始展示成 shuffle）
+    private int lastLyricsIdx = -1; // 最近一次歌词行号，用于跨 tick 去重 setX 调用
 
     // ===== 仅在"QQ 歌词模式"下使用的缓存/本地时钟 =====
     private MediaMetadataCompat lastRemoteMeta = null;
@@ -99,37 +100,35 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     private static final int AUTO_START_MAX_ATTEMPTS = 3;
     private static final long AUTO_START_RETRY_DELAY_MS = 2000L;
 
-    // ===== 发现循环（AA bind 后用来一直找 token） =====
-    // 关键路径：用户的理想流程是"QQ 已播放 → AA 启动 → Bixby 拉起糯米"。
-    // Bixby 拉起糯米可能比 AA bind 慢几十秒；Sniffer NLS 绑上也可能慢。
-    // 用一个 60s 的自适应循环，每次 tick 之间逐步退避（0.5s→8s 上限），
-    // 拿到 remoteCtrl 立刻停。每次 onGetRoot/onLoadChildren 都会重启循环计时。
+    // ===== 发现循环（AA bind 后用来持续请求 token） =====
+    // AA bind 与目标 App / NLS 绑定可能有数十秒延迟。
+    // 用 60s 自适应循环，tick 间逐步退避（0.5s → 8s 上限），
+    // 拿到 remoteCtrl 立刻停。onGetRoot / onLoadChildren 会刷新窗口起点。
     private long discoveryStartElapsed = 0L;
     private long discoveryNextDelay = 0L;
     private boolean discoveryRunning = false;
+    private int discoveryTickCount = 0;
     private static final long DISCOVERY_WINDOW_MS = 60_000L;
     private static final long DISCOVERY_INITIAL_DELAY_MS = 500L;
     private static final long DISCOVERY_MAX_DELAY_MS = 8_000L;
+    // 只在前 3 个 tick 主动叫 NLS 重绑：rebind 只对"NLS 还没连上"有效，
+    // Sniffer 已经活着的情况下持续 rebind 是纯浪费 IPC + 日志噪音。
+    private static final int DISCOVERY_REBIND_TICK_LIMIT = 3;
 
     private final Runnable discoveryTick = new Runnable() {
         @Override public void run() {
-            if (remoteCtrl != null) {
-                discoveryRunning = false;
-                Log.i(TAG, "✅ 发现循环已拿到 token，停止");
-                return;
-            }
+            if (remoteCtrl != null) { stopDiscovery("got-token"); return; }
             long elapsed = SystemClock.elapsedRealtime() - discoveryStartElapsed;
-            if (elapsed > DISCOVERY_WINDOW_MS) {
-                discoveryRunning = false;
-                Log.i(TAG, "⏰ 发现循环超时（60s）放弃");
-                return;
-            }
-            Log.i(TAG, "🔁 发现循环 tick elapsed=" + elapsed + "ms");
+            if (elapsed > DISCOVERY_WINDOW_MS) { stopDiscovery("timeout"); return; }
+
+            discoveryTickCount++;
             LocalBroadcastManager.getInstance(MyMusicService.this)
                     .sendBroadcast(new Intent(ACTION_REQUEST_TOKEN));
-            requestSnifferRebind();
+            if (discoveryTickCount <= DISCOVERY_REBIND_TICK_LIMIT) {
+                requestSnifferRebind();
+            }
 
-            // 自适应退避：0.5 → 1 → 2 → 4 → 8s 后保持
+            // 自适应退避：0.5 → 1 → 2 → 4 → 8s 后封顶
             discoveryNextDelay = Math.min(DISCOVERY_MAX_DELAY_MS,
                     Math.max(DISCOVERY_INITIAL_DELAY_MS, discoveryNextDelay * 2));
             handler.postDelayed(this, discoveryNextDelay);
@@ -137,17 +136,25 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     };
 
     private void startDiscovery() {
-        // 重置窗口起点：每次 AA 来 bind 都重新给 60s 窗口。
-        discoveryStartElapsed = SystemClock.elapsedRealtime();
-        discoveryNextDelay = DISCOVERY_INITIAL_DELAY_MS;
         if (discoveryRunning) {
-            Log.i(TAG, "🔄 发现循环已运行，重置窗口");
+            // 已在跑：只刷新窗口起点；不要重置 nextDelay/tickCount，否则连续 onLoadChildren
+            // 会把退避退到 500ms 高频轮询。
+            discoveryStartElapsed = SystemClock.elapsedRealtime();
             return;
         }
+        discoveryStartElapsed = SystemClock.elapsedRealtime();
+        discoveryNextDelay = DISCOVERY_INITIAL_DELAY_MS;
+        discoveryTickCount = 0;
         discoveryRunning = true;
         Log.i(TAG, "🚦 启动发现循环（60s 窗口）");
-        // 立即触发一次
         handler.post(discoveryTick);
+    }
+
+    private void stopDiscovery(String reason) {
+        if (!discoveryRunning) return;
+        discoveryRunning = false;
+        handler.removeCallbacks(discoveryTick);
+        Log.i(TAG, "🛑 停止发现循环 reason=" + reason + " ticks=" + discoveryTickCount);
     }
 
     private void requestSnifferRebind() {
@@ -208,10 +215,10 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     /** 开启 QQ 歌词模式：拍快照、起定时器、立刻贴一帧覆盖。 */
     private void enterLyricsMode() {
         isLyricsMode = true;
+        lastLyricsIdx = -1; // 重置缓存：进入歌词模式后第一次 overlay 必须真正写入
         snapshotBaseFromRemote();
         handler.post(lyricsUpdater);
         if (remoteCtrl != null) {
-            applyLyricsOverlay(lastRemoteMeta);
             mirror(remoteCtrl.getMetadata(), remoteCtrl.getPlaybackState());
         }
     }
@@ -219,6 +226,7 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     /** 关闭歌词模式：停定时器、清拖动保护期。 */
     private void exitLyricsMode() {
         isLyricsMode = false;
+        lastLyricsIdx = -1;
         handler.removeCallbacks(lyricsUpdater);
         suppressRemoteState = false;
     }
@@ -304,16 +312,25 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     // 🪞 同步信息到本地 Session（按当前模式分支）
     // =========================================================
     private void mirror(MediaMetadataCompat meta, PlaybackStateCompat st) {
-        if (meta != null) mirrorMetadata(meta);
-        if (st != null) mirrorPlaybackState(meta, st);
-    }
-
-    private void mirrorMetadata(MediaMetadataCompat meta) {
-        if (!isNcmMode && isLyricsMode) {
-            applyLyricsOverlay(meta); // QQ 歌词模式：覆盖为"当前句/下一句"
+        boolean lyricsBranch = !isNcmMode && isLyricsMode;
+        if (lyricsBranch) {
+            // 一并处理：先把 PlaybackState 的最新值打进 base 时钟，再让 applyLyricsOverlay
+            // 一次性 set metadata + playback state（避免 mirrorMetadata + mirrorPlaybackState
+            // 在 lyrics 模式下双写 PlaybackState）。
+            if (st != null && !suppressRemoteState) {
+                basePosMs = st.getPosition();
+                baseSpeed = st.getPlaybackSpeed();
+                baseState = st.getState();
+                baseUpdateElapsed = SystemClock.elapsedRealtime();
+            }
+            applyLyricsOverlay(meta != null ? meta : lastRemoteMeta);
             return;
         }
-        // QQ 非歌词模式 或 NCM 模式：原样映射标准字段
+        if (meta != null) mirrorMetadataStandard(meta);
+        if (st != null) mirrorPlaybackStateStandard(meta, st);
+    }
+
+    private void mirrorMetadataStandard(MediaMetadataCompat meta) {
         String title = meta.getString(MediaMetadataCompat.METADATA_KEY_TITLE);
         String artist = meta.getString(MediaMetadataCompat.METADATA_KEY_ARTIST);
         persistLastMeta(title, artist);
@@ -332,30 +349,9 @@ public class MyMusicService extends MediaBrowserServiceCompat {
         mSession.setMetadata(builder.build());
     }
 
-    private void mirrorPlaybackState(MediaMetadataCompat meta, PlaybackStateCompat st) {
-        // QQ 歌词模式分支（NCM 强制关闭歌词，不走此分支）
-        if (!isNcmMode && isLyricsMode) {
-            if (!suppressRemoteState) {
-                basePosMs = st.getPosition();
-                baseSpeed = st.getPlaybackSpeed();
-                baseState = st.getState();
-                baseUpdateElapsed = SystemClock.elapsedRealtime();
-            }
-            int code = st.getState();
-            // STATE_NONE/STOPPED 时强制 PAUSED，避免 AA 跳回浏览页
-            if (code == PlaybackStateCompat.STATE_NONE || code == PlaybackStateCompat.STATE_STOPPED) {
-                code = PlaybackStateCompat.STATE_PAUSED;
-            }
-            PlaybackStateCompat.Builder builder = new PlaybackStateCompat.Builder()
-                    .setState(code, clockPosition(), (baseSpeed == 0f ? 1.0f : baseSpeed))
-                    .setActions(STANDARD_ACTIONS);
-            addQqCustomActions(builder, lastPlayMode);
-            mSession.setPlaybackState(builder.build());
-            return;
-        }
-
-        // QQ 非歌词 / NCM 通用分支：跳过 NONE/STOPPED
+    private void mirrorPlaybackStateStandard(MediaMetadataCompat meta, PlaybackStateCompat st) {
         int code = st.getState();
+        // STATE_NONE/STOPPED 直接跳过：避免 AA 跳回浏览页 & 减少无意义写入
         if (code == PlaybackStateCompat.STATE_NONE || code == PlaybackStateCompat.STATE_STOPPED) return;
 
         PlaybackStateCompat.Builder builder = new PlaybackStateCompat.Builder()
@@ -388,17 +384,23 @@ public class MyMusicService extends MediaBrowserServiceCompat {
         if (dur > 0) durationMs = dur;
 
         String lyricsWhole = meta.getString(META_KEY_LYRICS_WHOLE);
+        boolean lyricsChanged = false;
         if (lyricsWhole != null && !lyricsWhole.equals(lastLyricsRaw)) {
             lastLyricsRaw = lyricsWhole;
             parseLyrics(lyricsWhole);
+            lyricsChanged = true; // 换歌：必须重写一次 metadata 让 AA 拿到新封面/时长
         }
 
+        int idx = parsedLyrics.isEmpty() ? -1 : findLyricsIndex(clockPosition());
+        // 性能关键：lyricsUpdater 每秒触发一次，但歌词行通常 3~5s 才换一次。
+        // 行号没变且不是换歌，跳过两次 IPC（setMetadata + setPlaybackState）。
+        // AA 自己会基于 (position, lastUpdated, speed) 推算进度条，不需要每秒推送。
+        if (idx == lastLyricsIdx && !lyricsChanged) return;
+        lastLyricsIdx = idx;
+
         String current = "", next = "";
-        if (!parsedLyrics.isEmpty()) {
-            int idx = findLyricsIndex(clockPosition());
-            if (idx >= 0) current = parsedLyrics.get(idx).second;
-            if (idx + 1 < parsedLyrics.size()) next = parsedLyrics.get(idx + 1).second;
-        }
+        if (idx >= 0) current = parsedLyrics.get(idx).second;
+        if (idx + 1 < parsedLyrics.size()) next = parsedLyrics.get(idx + 1).second;
 
         MediaMetadataCompat.Builder b = new MediaMetadataCompat.Builder()
                 .putString(MediaMetadataCompat.METADATA_KEY_TITLE, current)
@@ -487,6 +489,9 @@ public class MyMusicService extends MediaBrowserServiceCompat {
                 remoteCtrl = new MediaControllerCompat(MyMusicService.this, tk);
                 remoteCtrl.registerCallback(remoteCb);
                 Log.i(TAG, "✅ 已绑定远端控制器，pkg=" + sourcePkg);
+                // 拿到 token 后立即停掉所有还在排队的发现/重试任务，省一波 IPC + 日志。
+                stopDiscovery("got-token");
+                disconnectAutoStartBrowser();
                 mirror(remoteCtrl.getMetadata(), remoteCtrl.getPlaybackState());
                 updateSessionActive("tokenBound");
             } catch (Exception e) {
@@ -561,6 +566,7 @@ public class MyMusicService extends MediaBrowserServiceCompat {
                     basePosMs = positionMs;
                     baseUpdateElapsed = SystemClock.elapsedRealtime();
 
+                    lastLyricsIdx = -1; // seek 后强制下一次 overlay 真正写入
                     applyLyricsOverlay(lastRemoteMeta);
                 } else {
                     PlaybackStateCompat remoteState =
@@ -602,10 +608,9 @@ public class MyMusicService extends MediaBrowserServiceCompat {
         LocalBroadcastManager lbm = LocalBroadcastManager.getInstance(this);
         lbm.registerReceiver(tokenRx, new IntentFilter(ACTION_CONTROLLER));
 
-        // 主动唤醒 Sniffer：三星等省电策略下 NotificationListenerService 可能长期处于
-        // 未绑定状态，导致 onGetRoot 发出的 REQUEST_TOKEN 永远没人接。无论 Sniffer 当前
-        // 是否还活着，都让系统重新绑定一次 —— requestRebind 对"从未连接"和"曾经断开"
-        // 都成立，前提是用户授予过通知使用权。
+        // 主动唤醒 Sniffer：NotificationListenerService 可能长期处于未绑定状态，
+        // 导致 onGetRoot 发出的 REQUEST_TOKEN 没有接收方。requestRebind 对"从未连接"
+        // 和"曾经断开"均有效，前提是用户已授予通知使用权。
         requestSnifferRebind();
 
 
