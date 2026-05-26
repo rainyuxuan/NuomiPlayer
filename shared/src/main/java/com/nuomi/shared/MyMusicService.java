@@ -1,30 +1,29 @@
 package com.nuomi.shared;
+
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-
 import android.content.SharedPreferences;
+import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
 import android.os.Bundle;
-
-import androidx.annotation.NonNull;
-
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.service.notification.NotificationListenerService;
 import android.support.v4.media.MediaBrowserCompat;
-
-import androidx.localbroadcastmanager.content.LocalBroadcastManager;
-import androidx.media.MediaBrowserServiceCompat;
-
 import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.session.MediaControllerCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
 import android.util.Log;
 import android.util.Pair;
+
+import androidx.annotation.NonNull;
+import androidx.localbroadcastmanager.content.LocalBroadcastManager;
+import androidx.media.MediaBrowserServiceCompat;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -42,8 +41,27 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     private static final String CUSTOM_ACTION_REPEAT_MODE = "com.nuomi.REPEAT_MODE";
 
     private static final String ACTION_CONTROLLER = "com.nuomi.ACTION_CONTROLLER";
-
+    private static final String ACTION_REQUEST_TOKEN = "com.nuomi.REQUEST_TOKEN";
     private static final String ACTION_TOGGLE_LYRICS_MODE = "com.nuomi.ACTION_TOGGLE_LYRICS_MODE";
+
+    private static final String PKG_QQMUSIC = "com.tencent.qqmusic";
+    private static final String QQ_ACTION_PLAY_MODE_WIDGET =
+            "com.tencent.qqmusic.ACTION_SERVICE_PLAY_MODE_WIDGET.QQMusicPhone";
+    private static final String META_KEY_PLAY_MODE = "ucar.media.metadata.PLAY_MODE";
+    private static final String META_KEY_LYRICS_WHOLE = "ucar.media.metadata.LYRICS_WHOLE";
+
+    private static final String SP_SESSION = "session_pref";
+    private static final String SP_LAST_PKG = "last_pkg";
+    private static final String SP_LAST_META = "last_meta";
+    private static final String SP_SETTINGS = "settings";
+
+    private static final long STANDARD_ACTIONS =
+            PlaybackStateCompat.ACTION_PLAY
+            | PlaybackStateCompat.ACTION_PAUSE
+            | PlaybackStateCompat.ACTION_SKIP_TO_NEXT
+            | PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
+            | PlaybackStateCompat.ACTION_SEEK_TO
+            | PlaybackStateCompat.ACTION_PLAY_PAUSE;
 
     private List<Pair<Long, String>> parsedLyrics = new ArrayList<>();
     private boolean isLyricsMode = false; // 仅 QQ 模式可用；NCM 模式强制关闭
@@ -66,14 +84,82 @@ public class MyMusicService extends MediaBrowserServiceCompat {
 
     private String lastLyricsRaw = null;
 
-    // 新增：当前是否处于"网易云模式"
-    private boolean isNcmMode = false;  // false=QQ 模式；true=非QQ（任意播放器）模式
+    // 当前是否处于"网易云模式"（false=QQ 模式；true=非 QQ）
+    private boolean isNcmMode = false;
 
-    // 新增：防止重复激活
-    private boolean sessionActivated = false;
+    // 用来在后台 bind 目标 App 的 MediaBrowserService 并触发 play()。
+    private MediaBrowserCompat autoStartBrowser;
+    private int autoStartAttempts = 0;
 
-    // 放在成员里
     private static final String TAG = "Mirror";
+
+    // mobile 模块里的 Sniffer 组件名（shared 不能直接引用 mobile 类，硬编码字符串避免循环依赖）
+    private static final String SNIFFER_CLASS = "com.nuomi.MusicSessionSniffer";
+    private static final String MEDIA_BROWSER_SERVICE_ACTION = "android.media.browse.MediaBrowserService";
+    private static final int AUTO_START_MAX_ATTEMPTS = 3;
+    private static final long AUTO_START_RETRY_DELAY_MS = 2000L;
+
+    // ===== 发现循环（AA bind 后用来一直找 token） =====
+    // 关键路径：用户的理想流程是"QQ 已播放 → AA 启动 → Bixby 拉起糯米"。
+    // Bixby 拉起糯米可能比 AA bind 慢几十秒；Sniffer NLS 绑上也可能慢。
+    // 用一个 60s 的自适应循环，每次 tick 之间逐步退避（0.5s→8s 上限），
+    // 拿到 remoteCtrl 立刻停。每次 onGetRoot/onLoadChildren 都会重启循环计时。
+    private long discoveryStartElapsed = 0L;
+    private long discoveryNextDelay = 0L;
+    private boolean discoveryRunning = false;
+    private static final long DISCOVERY_WINDOW_MS = 60_000L;
+    private static final long DISCOVERY_INITIAL_DELAY_MS = 500L;
+    private static final long DISCOVERY_MAX_DELAY_MS = 8_000L;
+
+    private final Runnable discoveryTick = new Runnable() {
+        @Override public void run() {
+            if (remoteCtrl != null) {
+                discoveryRunning = false;
+                Log.i(TAG, "✅ 发现循环已拿到 token，停止");
+                return;
+            }
+            long elapsed = SystemClock.elapsedRealtime() - discoveryStartElapsed;
+            if (elapsed > DISCOVERY_WINDOW_MS) {
+                discoveryRunning = false;
+                Log.i(TAG, "⏰ 发现循环超时（60s）放弃");
+                return;
+            }
+            Log.i(TAG, "🔁 发现循环 tick elapsed=" + elapsed + "ms");
+            LocalBroadcastManager.getInstance(MyMusicService.this)
+                    .sendBroadcast(new Intent(ACTION_REQUEST_TOKEN));
+            requestSnifferRebind();
+
+            // 自适应退避：0.5 → 1 → 2 → 4 → 8s 后保持
+            discoveryNextDelay = Math.min(DISCOVERY_MAX_DELAY_MS,
+                    Math.max(DISCOVERY_INITIAL_DELAY_MS, discoveryNextDelay * 2));
+            handler.postDelayed(this, discoveryNextDelay);
+        }
+    };
+
+    private void startDiscovery() {
+        // 重置窗口起点：每次 AA 来 bind 都重新给 60s 窗口。
+        discoveryStartElapsed = SystemClock.elapsedRealtime();
+        discoveryNextDelay = DISCOVERY_INITIAL_DELAY_MS;
+        if (discoveryRunning) {
+            Log.i(TAG, "🔄 发现循环已运行，重置窗口");
+            return;
+        }
+        discoveryRunning = true;
+        Log.i(TAG, "🚦 启动发现循环（60s 窗口）");
+        // 立即触发一次
+        handler.post(discoveryTick);
+    }
+
+    private void requestSnifferRebind() {
+        try {
+            ComponentName cn = new ComponentName(getPackageName(), SNIFFER_CLASS);
+            NotificationListenerService.requestRebind(cn);
+            Log.i(TAG, "🛎 已请求重绑 Sniffer: " + cn.flattenToShortString());
+        } catch (Throwable t) {
+            // 用户未授权 / 组件不存在（automotive 变体）/ 任何系统异常都不应让服务崩溃
+            Log.w(TAG, "requestRebind 失败: " + t.getMessage());
+        }
+    }
 
     private void updateSessionActive(String reason) {
         // session 只要 service 在运行就保持 active，让 AA 始终能发现此应用。
@@ -86,17 +172,77 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     }
 
     private PlaybackStateCompat buildMinimalState(int state, long pos, float speed) {
-        long ACTIONS = PlaybackStateCompat.ACTION_PLAY
-                | PlaybackStateCompat.ACTION_PAUSE
-                | PlaybackStateCompat.ACTION_SKIP_TO_NEXT
-                | PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
-                | PlaybackStateCompat.ACTION_SEEK_TO
-                | PlaybackStateCompat.ACTION_PLAY_PAUSE;
-
         return new PlaybackStateCompat.Builder()
                 .setState(state, pos, speed, SystemClock.elapsedRealtime())
-                .setActions(ACTIONS)
+                .setActions(STANDARD_ACTIONS)
                 .build();
+    }
+
+    private int resolveRepeatIcon(int playMode) {
+        switch (playMode) {
+            case 1: return R.drawable.ic_repeat_one_24dp;
+            case 0: return R.drawable.ic_shuffle_24dp;
+            case 2:
+            default: return R.drawable.ic_repeat_24dp;
+        }
+    }
+
+    /** 给 PlaybackState builder 追加 QQ 模式的"歌词 + 循环"两个自定义按钮。 */
+    private void addQqCustomActions(PlaybackStateCompat.Builder builder, int playMode) {
+        int lyricsIconRes = isLyricsMode ? R.drawable.ic_lyrics_24dp : R.drawable.ic_lyrics_outline_24dp;
+        builder.addCustomAction(new PlaybackStateCompat.CustomAction.Builder(
+                CUSTOM_ACTION_SHOW_LYRICS, "歌词", lyricsIconRes).build());
+        builder.addCustomAction(new PlaybackStateCompat.CustomAction.Builder(
+                CUSTOM_ACTION_REPEAT_MODE, "循环", resolveRepeatIcon(playMode)).build());
+    }
+
+    /** 用 lastRemoteState 把"基准位置/速度/状态/时钟"快照对齐，供 clockPosition() 推算。 */
+    private void snapshotBaseFromRemote() {
+        if (lastRemoteState == null) return;
+        basePosMs = lastRemoteState.getPosition();
+        baseSpeed = lastRemoteState.getPlaybackSpeed();
+        baseState = lastRemoteState.getState();
+        baseUpdateElapsed = SystemClock.elapsedRealtime();
+    }
+
+    /** 开启 QQ 歌词模式：拍快照、起定时器、立刻贴一帧覆盖。 */
+    private void enterLyricsMode() {
+        isLyricsMode = true;
+        snapshotBaseFromRemote();
+        handler.post(lyricsUpdater);
+        if (remoteCtrl != null) {
+            applyLyricsOverlay(lastRemoteMeta);
+            mirror(remoteCtrl.getMetadata(), remoteCtrl.getPlaybackState());
+        }
+    }
+
+    /** 关闭歌词模式：停定时器、清拖动保护期。 */
+    private void exitLyricsMode() {
+        isLyricsMode = false;
+        handler.removeCallbacks(lyricsUpdater);
+        suppressRemoteState = false;
+    }
+
+    /**
+     * 给 AA 一个非空的初始 metadata + PAUSED 状态。
+     * 冷启动 / 数据清除 / Sniffer 未连上时，避免 session 处于"空 metadata + NONE"
+     * 让 AA 立刻显示"无法获享媒体内容"。
+     */
+    private void seedInitialSessionContent() {
+        SharedPreferences lastMeta = getSharedPreferences(SP_LAST_META, MODE_PRIVATE);
+        String savedTitle = lastMeta.getString("title", null);
+        String savedArtist = lastMeta.getString("artist", "");
+        if (savedTitle == null) {
+            savedTitle = "糯米播放器";
+            savedArtist = "等待音乐源…";
+        }
+        mSession.setMetadata(new MediaMetadataCompat.Builder()
+                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, savedTitle)
+                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, savedArtist)
+                .build());
+        mSession.setPlaybackState(buildMinimalState(
+                PlaybackStateCompat.STATE_PAUSED, 0, 0f));
+        Log.i(TAG, "🗃 初始 metadata: " + savedTitle);
     }
 
 
@@ -125,29 +271,15 @@ public class MyMusicService extends MediaBrowserServiceCompat {
 
     // "自动开启歌词模式"广播，仅 QQ 模式生效
     private final BroadcastReceiver autoLyricsReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            Log.i("Mirror", "📨 收到自动开启歌词模式请求");
-            if (isNcmMode) { // 非QQ模式
-                Log.i("Mirror", "ℹ️ 当前为【非 QQ 模式】，忽略开启歌词模式请求");
+        @Override public void onReceive(Context context, Intent intent) {
+            Log.i(TAG, "📨 收到自动开启歌词模式请求");
+            if (isNcmMode) {
+                Log.i(TAG, "ℹ️ 非 QQ 模式，忽略歌词请求");
                 return;
             }
             if (!isLyricsMode) {
-                isLyricsMode = true;
-                Log.i("Mirror", "🎵 已开启歌词模式（QQ）");
-
-                if (lastRemoteState != null) {
-                    basePosMs = lastRemoteState.getPosition();
-                    baseSpeed = lastRemoteState.getPlaybackSpeed();
-                    baseState = lastRemoteState.getState();
-                    baseUpdateElapsed = SystemClock.elapsedRealtime();
-                }
-
-                handler.post(lyricsUpdater);
-                if (remoteCtrl != null) {
-                    applyLyricsOverlay(lastRemoteMeta);
-                    mirror(remoteCtrl.getMetadata(), remoteCtrl.getPlaybackState());
-                }
+                Log.i(TAG, "🎵 已开启歌词模式（QQ）");
+                enterLyricsMode();
             }
         }
     };
@@ -169,220 +301,158 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     }
 
     // =========================================================
-    // 🪞 同步信息到本地 Session（根据当前来源分支）
+    // 🪞 同步信息到本地 Session（按当前模式分支）
     // =========================================================
     private void mirror(MediaMetadataCompat meta, PlaybackStateCompat st) {
+        if (meta != null) mirrorMetadata(meta);
+        if (st != null) mirrorPlaybackState(meta, st);
+    }
 
-        // --- 1. 同步元数据 ---
-        if (meta != null) {
-            if (!isNcmMode && isLyricsMode) {
-                // QQ 歌词模式：覆盖为"当前句/下一句"
-                applyLyricsOverlay(meta);
-            } else {
-                // QQ 非歌词模式 或 NCM 模式：原样映射标准字段
-                MediaMetadataCompat.Builder builder = new MediaMetadataCompat.Builder();
+    private void mirrorMetadata(MediaMetadataCompat meta) {
+        if (!isNcmMode && isLyricsMode) {
+            applyLyricsOverlay(meta); // QQ 歌词模式：覆盖为"当前句/下一句"
+            return;
+        }
+        // QQ 非歌词模式 或 NCM 模式：原样映射标准字段
+        String title = meta.getString(MediaMetadataCompat.METADATA_KEY_TITLE);
+        String artist = meta.getString(MediaMetadataCompat.METADATA_KEY_ARTIST);
+        persistLastMeta(title, artist);
 
-                String title = meta.getString(MediaMetadataCompat.METADATA_KEY_TITLE);
-                String artist = meta.getString(MediaMetadataCompat.METADATA_KEY_ARTIST);
-
-                // 持久化歌曲信息：下次冷启动时可立即展示给 AA，减少"无内容"窗口。
-                if (title != null) {
-                    getSharedPreferences("last_meta", MODE_PRIVATE).edit()
-                            .putString("title", title)
-                            .putString("artist", artist != null ? artist : "")
-                            .apply();
-                }
-
-                long duration = meta.getLong(MediaMetadataCompat.METADATA_KEY_DURATION);
-
-                // QQ 模式保留 playMode；NCM 没有该私有键，忽略即可
-                if (!isNcmMode) {
-                    long playMode = meta.getLong("ucar.media.metadata.PLAY_MODE");
-                    lastPlayMode = (int) playMode;
-                }
-
-                builder.putString(MediaMetadataCompat.METADATA_KEY_TITLE, title);
-                builder.putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist);
-
-                if (duration > 0)
-                    builder.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, duration);
-
-                // ✅ 仅在"非 QQ 模式"启用封面位图兜底；QQ 模式保持你原来的只取 ALBUM_ART 行为
-                Bitmap art = null;
-                if (isNcmMode) {
-                    // 非 QQ：位图优先顺序 ALBUM_ART → DISPLAY_ICON → ART
-                    art = meta.getBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART);
-                    if (art == null) art = meta.getBitmap(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON);
-                    if (art == null) art = meta.getBitmap(MediaMetadataCompat.METADATA_KEY_ART);
-                } else {
-                    // QQ：保持原逻辑（只取 ALBUM_ART）
-                    art = meta.getBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART);
-                }
-
-                if (art != null) {
-                    builder.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, art);
-                }
-
-                mSession.setMetadata(builder.build());
-            }
+        if (!isNcmMode) {
+            lastPlayMode = (int) meta.getLong(META_KEY_PLAY_MODE);
         }
 
-        // --- 2. 同步播放状态 ---
-        if (st != null) {
+        MediaMetadataCompat.Builder builder = new MediaMetadataCompat.Builder()
+                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title)
+                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist);
+        long duration = meta.getLong(MediaMetadataCompat.METADATA_KEY_DURATION);
+        if (duration > 0) builder.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, duration);
+        Bitmap art = pickAlbumArt(meta);
+        if (art != null) builder.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, art);
+        mSession.setMetadata(builder.build());
+    }
 
-            // QQ 歌词模式专用分支（NCM 模式强制关闭歌词，不走此分支）
-            if (!isNcmMode && isLyricsMode) {
-                if (!suppressRemoteState) {
-                    basePosMs = st.getPosition();
-                    baseSpeed = st.getPlaybackSpeed();
-                    baseState = st.getState();
-                    baseUpdateElapsed = SystemClock.elapsedRealtime();
-                }
-
-                int code = st.getState();
-                if (code == PlaybackStateCompat.STATE_NONE || code == PlaybackStateCompat.STATE_STOPPED) {
-                    code = PlaybackStateCompat.STATE_PAUSED; // 避免 AA 跳回浏览页
-                }
-
-                PlaybackStateCompat.Builder builder = new PlaybackStateCompat.Builder()
-                        .setState(code, clockPosition(), (baseSpeed == 0f ? 1.0f : baseSpeed))
-                        .setActions(
-                                PlaybackStateCompat.ACTION_PLAY |
-                                        PlaybackStateCompat.ACTION_PAUSE |
-                                        PlaybackStateCompat.ACTION_SKIP_TO_NEXT |
-                                        PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS |
-                                        PlaybackStateCompat.ACTION_SEEK_TO |
-                                        PlaybackStateCompat.ACTION_PLAY_PAUSE
-                        );
-
-                // 自定义按钮（仅 QQ 模式展示）
-                int lyricsIconRes = isLyricsMode ? R.drawable.ic_lyrics_24dp : R.drawable.ic_lyrics_outline_24dp;
-                builder.addCustomAction(new PlaybackStateCompat.CustomAction.Builder(
-                        CUSTOM_ACTION_SHOW_LYRICS, "歌词", lyricsIconRes).build());
-
-                int repeatIconRes;
-                switch (lastPlayMode) {
-                    case 1: repeatIconRes = R.drawable.ic_repeat_one_24dp; break;
-                    case 0: repeatIconRes = R.drawable.ic_shuffle_24dp;    break;
-                    case 2:
-                    default: repeatIconRes = R.drawable.ic_repeat_24dp;    break;
-                }
-                builder.addCustomAction(new PlaybackStateCompat.CustomAction.Builder(
-                        CUSTOM_ACTION_REPEAT_MODE, "循环", repeatIconRes).build());
-
-                mSession.setPlaybackState(builder.build());
-                return;
+    private void mirrorPlaybackState(MediaMetadataCompat meta, PlaybackStateCompat st) {
+        // QQ 歌词模式分支（NCM 强制关闭歌词，不走此分支）
+        if (!isNcmMode && isLyricsMode) {
+            if (!suppressRemoteState) {
+                basePosMs = st.getPosition();
+                baseSpeed = st.getPlaybackSpeed();
+                baseState = st.getState();
+                baseUpdateElapsed = SystemClock.elapsedRealtime();
             }
-
-            // —— QQ 非歌词模式 或 NCM 模式通用分支 ——
             int code = st.getState();
-            if (code == PlaybackStateCompat.STATE_NONE ||
-                    code == PlaybackStateCompat.STATE_STOPPED) {
-                return;
+            // STATE_NONE/STOPPED 时强制 PAUSED，避免 AA 跳回浏览页
+            if (code == PlaybackStateCompat.STATE_NONE || code == PlaybackStateCompat.STATE_STOPPED) {
+                code = PlaybackStateCompat.STATE_PAUSED;
             }
-
             PlaybackStateCompat.Builder builder = new PlaybackStateCompat.Builder()
-                    .setState(code, st.getPosition(), st.getPlaybackSpeed())
-                    .setActions(
-                            PlaybackStateCompat.ACTION_PLAY |
-                                    PlaybackStateCompat.ACTION_PAUSE |
-                                    PlaybackStateCompat.ACTION_SKIP_TO_NEXT |
-                                    PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS |
-                                    PlaybackStateCompat.ACTION_SEEK_TO |
-                                    PlaybackStateCompat.ACTION_PLAY_PAUSE
-                    );
-
-            // 仅 QQ 模式下加入自定义按钮；NCM 模式完全关闭"歌词/循环"按钮
-            if (!isNcmMode) {
-                int lyricsIconRes = isLyricsMode ? R.drawable.ic_lyrics_24dp : R.drawable.ic_lyrics_outline_24dp;
-                builder.addCustomAction(new PlaybackStateCompat.CustomAction.Builder(
-                        CUSTOM_ACTION_SHOW_LYRICS, "歌词", lyricsIconRes).build());
-
-                int repeatIconRes = R.drawable.ic_repeat_24dp;
-                if (meta != null) {
-                    long playMode = meta.getLong("ucar.media.metadata.PLAY_MODE");
-                    switch ((int) playMode) {
-                        case 1: repeatIconRes = R.drawable.ic_repeat_one_24dp; break;
-                        case 0: repeatIconRes = R.drawable.ic_shuffle_24dp;    break;
-                        case 2:
-                        default: repeatIconRes = R.drawable.ic_repeat_24dp;    break;
-                    }
-                }
-                builder.addCustomAction(new PlaybackStateCompat.CustomAction.Builder(
-                        CUSTOM_ACTION_REPEAT_MODE, "循环", repeatIconRes).build());
-            }
-
+                    .setState(code, clockPosition(), (baseSpeed == 0f ? 1.0f : baseSpeed))
+                    .setActions(STANDARD_ACTIONS);
+            addQqCustomActions(builder, lastPlayMode);
             mSession.setPlaybackState(builder.build());
+            return;
         }
+
+        // QQ 非歌词 / NCM 通用分支：跳过 NONE/STOPPED
+        int code = st.getState();
+        if (code == PlaybackStateCompat.STATE_NONE || code == PlaybackStateCompat.STATE_STOPPED) return;
+
+        PlaybackStateCompat.Builder builder = new PlaybackStateCompat.Builder()
+                .setState(code, st.getPosition(), st.getPlaybackSpeed())
+                .setActions(STANDARD_ACTIONS);
+        if (!isNcmMode) {
+            int playMode = (meta != null) ? (int) meta.getLong(META_KEY_PLAY_MODE) : lastPlayMode;
+            addQqCustomActions(builder, playMode);
+        }
+        mSession.setPlaybackState(builder.build());
+    }
+
+    /** 二分查找：找到最大的 i 使 parsedLyrics[i].first <= t；找不到返回 -1。 */
+    private int findLyricsIndex(long t) {
+        int lo = 0, hi = parsedLyrics.size() - 1, ans = -1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            if (parsedLyrics.get(mid).first <= t) { ans = mid; lo = mid + 1; }
+            else hi = mid - 1;
+        }
+        return ans;
     }
 
     // 仅在"QQ 歌词模式"调用：把当前/下一句覆盖到元数据
     private void applyLyricsOverlay(MediaMetadataCompat meta) {
         if (isNcmMode || !isLyricsMode || meta == null) return;
 
-        long playMode = meta.getLong("ucar.media.metadata.PLAY_MODE");
-        lastPlayMode = (int) playMode;
+        lastPlayMode = (int) meta.getLong(META_KEY_PLAY_MODE);
         long dur = meta.getLong(MediaMetadataCompat.METADATA_KEY_DURATION);
         if (dur > 0) durationMs = dur;
 
-        String lyricsWhole = meta.getString("ucar.media.metadata.LYRICS_WHOLE");
+        String lyricsWhole = meta.getString(META_KEY_LYRICS_WHOLE);
         if (lyricsWhole != null && !lyricsWhole.equals(lastLyricsRaw)) {
             lastLyricsRaw = lyricsWhole;
             parseLyrics(lyricsWhole);
         }
 
-        long t = clockPosition();
         String current = "", next = "";
         if (!parsedLyrics.isEmpty()) {
-            int lo = 0, hi = parsedLyrics.size() - 1, ans = -1;
-            while (lo <= hi) {
-                int mid = (lo + hi) >>> 1;
-                if (parsedLyrics.get(mid).first <= t) { ans = mid; lo = mid + 1; }
-                else hi = mid - 1;
-            }
-            if (ans >= 0) current = parsedLyrics.get(ans).second;
-            if (ans + 1 < parsedLyrics.size()) next = parsedLyrics.get(ans + 1).second;
+            int idx = findLyricsIndex(clockPosition());
+            if (idx >= 0) current = parsedLyrics.get(idx).second;
+            if (idx + 1 < parsedLyrics.size()) next = parsedLyrics.get(idx + 1).second;
         }
 
-        MediaMetadataCompat.Builder b = new MediaMetadataCompat.Builder();
-        b.putString(MediaMetadataCompat.METADATA_KEY_TITLE, current);
-        b.putString(MediaMetadataCompat.METADATA_KEY_ARTIST, next);
-
+        MediaMetadataCompat.Builder b = new MediaMetadataCompat.Builder()
+                .putString(MediaMetadataCompat.METADATA_KEY_TITLE, current)
+                .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, next);
         Bitmap art = meta.getBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART);
         if (art != null) b.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, art);
         if (durationMs > 0) b.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, durationMs);
-
         mSession.setMetadata(b.build());
 
         int code = (baseState == PlaybackStateCompat.STATE_NONE || baseState == PlaybackStateCompat.STATE_STOPPED)
                 ? PlaybackStateCompat.STATE_PAUSED : baseState;
-
         PlaybackStateCompat.Builder ps = new PlaybackStateCompat.Builder()
                 .setState(code, clockPosition(), (baseSpeed == 0f ? 1.0f : baseSpeed))
-                .setActions(
-                        PlaybackStateCompat.ACTION_PLAY |
-                                PlaybackStateCompat.ACTION_PAUSE |
-                                PlaybackStateCompat.ACTION_SKIP_TO_NEXT |
-                                PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS |
-                                PlaybackStateCompat.ACTION_SEEK_TO |
-                                PlaybackStateCompat.ACTION_PLAY_PAUSE
-                );
-
-        int lyricsIconRes = R.drawable.ic_lyrics_24dp;
-        ps.addCustomAction(new PlaybackStateCompat.CustomAction.Builder(
-                CUSTOM_ACTION_SHOW_LYRICS, "歌词", lyricsIconRes).build());
-
-        int repeatIconRes;
-        switch (lastPlayMode) {
-            case 1: repeatIconRes = R.drawable.ic_repeat_one_24dp; break;
-            case 0: repeatIconRes = R.drawable.ic_shuffle_24dp;    break;
-            case 2:
-            default: repeatIconRes = R.drawable.ic_repeat_24dp;    break;
-        }
-        ps.addCustomAction(new PlaybackStateCompat.CustomAction.Builder(
-                CUSTOM_ACTION_REPEAT_MODE, "循环", repeatIconRes).build());
-
+                .setActions(STANDARD_ACTIONS);
+        addQqCustomActions(ps, lastPlayMode);
         mSession.setPlaybackState(ps.build());
+    }
+
+    private String readChosenPkg() {
+        return getSharedPreferences(SP_SESSION, MODE_PRIVATE).getString(SP_LAST_PKG, null);
+    }
+
+    /** 持久化最新一首歌：下次冷启动可立即用作占位 metadata，减少"无内容"白屏。 */
+    private void persistLastMeta(String title, String artist) {
+        if (title == null) return;
+        getSharedPreferences(SP_LAST_META, MODE_PRIVATE).edit()
+                .putString("title", title)
+                .putString("artist", artist != null ? artist : "")
+                .apply();
+    }
+
+    /** 封面图取色：非 QQ 时按 ALBUM_ART → DISPLAY_ICON → ART 兜底；QQ 仅取 ALBUM_ART。 */
+    private Bitmap pickAlbumArt(MediaMetadataCompat meta) {
+        Bitmap art = meta.getBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART);
+        if (art != null || !isNcmMode) return art;
+        art = meta.getBitmap(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON);
+        if (art == null) art = meta.getBitmap(MediaMetadataCompat.METADATA_KEY_ART);
+        return art;
+    }
+
+    /** 根据来源包是否 QQ 切换模式；进入非 QQ 时强制关闭歌词模式。 */
+    private void switchModeForSource(String sourcePkg) {
+        boolean toNonQqMode = !PKG_QQMUSIC.equals(sourcePkg);
+        if (toNonQqMode == isNcmMode) return;
+        isNcmMode = toNonQqMode;
+        if (isNcmMode) {
+            Log.i(TAG, "🔄 切换为【非 QQ 模式】，来源=" + sourcePkg);
+            if (isLyricsMode) {
+                exitLyricsMode();
+                Log.i(TAG, "🧹 已关闭歌词模式（进入非 QQ）");
+            }
+        } else {
+            Log.i(TAG, "🔄 切换为【QQ 模式】");
+        }
     }
 
     // =========================================================
@@ -392,65 +462,35 @@ public class MyMusicService extends MediaBrowserServiceCompat {
         @Override public void onReceive(Context c, Intent i) {
             if (!ACTION_CONTROLLER.equals(i.getAction())) return;
 
-            // 1) 广播来源的包名（Sniffer 填入）
             String sourcePkg = i.getStringExtra("pkg");
             if (sourcePkg == null) {
-                Log.w("Mirror", "⚠️ 收到控制广播但缺少 pkg");
+                Log.w(TAG, "⚠️ 收到控制广播但缺少 pkg");
                 return;
             }
-
-            // 2) 只采纳"当前选中的包名"
-            SharedPreferences sp = getSharedPreferences("session_pref", MODE_PRIVATE);
-            String chosenPkg = sp.getString("last_pkg", null);
+            String chosenPkg = readChosenPkg();
             if (chosenPkg == null || !chosenPkg.equals(sourcePkg)) {
-                Log.i("Mirror", "ℹ️ 忽略不同来源广播，当前选择=" + chosenPkg + "，广播来自=" + sourcePkg);
+                Log.i(TAG, "ℹ️ 忽略来源 " + sourcePkg + "（当前选中=" + chosenPkg + "）");
                 return;
             }
 
-            // 3) 根据来源是否 QQ 切换模式（非 QQ → 旧 NCM 逻辑）
-            boolean toNonQqMode = !"com.tencent.qqmusic".equals(sourcePkg);
-            if (toNonQqMode != isNcmMode) {
-                isNcmMode = toNonQqMode;
-                if (isNcmMode) {
-                    Log.i("Mirror", "🔄 切换为【非 QQ 模式】（禁用歌词/自定义按钮），来源=" + sourcePkg);
-                    if (isLyricsMode) {
-                        isLyricsMode = false;
-                        handler.removeCallbacks(lyricsUpdater);
-                        suppressRemoteState = false;
-                        Log.i("Mirror", "🧹 已关闭歌词模式并清理定时任务（进入非QQ）");
-                    }
-                } else {
-                    Log.i("Mirror", "🔄 切换为【QQ 模式】（可用歌词/自定义按钮）");
-                }
-            }
-
+            switchModeForSource(sourcePkg);
             updateSessionActive("sourceChanged:" + sourcePkg);
 
-
-            // 4) 取 Token → 绑定 Controller
             MediaSessionCompat.Token tk = i.getParcelableExtra("binder");
             if (tk == null) {
-                Log.w("Mirror", "⚠️ 广播中没有 binder Token");
+                Log.w(TAG, "⚠️ 广播中没有 binder Token");
                 return;
             }
 
             try {
-                if (remoteCtrl != null) {
-                    remoteCtrl.unregisterCallback(remoteCb);
-                }
+                if (remoteCtrl != null) remoteCtrl.unregisterCallback(remoteCb);
                 remoteCtrl = new MediaControllerCompat(MyMusicService.this, tk);
                 remoteCtrl.registerCallback(remoteCb);
-                Log.i("Mirror", "✅ 已绑定远端控制器，pkg=" + sourcePkg);
-
-
-
-                // 5) 同步一次
+                Log.i(TAG, "✅ 已绑定远端控制器，pkg=" + sourcePkg);
                 mirror(remoteCtrl.getMetadata(), remoteCtrl.getPlaybackState());
-
-                updateSessionActive("autoLyricsOnStartup");
-
+                updateSessionActive("tokenBound");
             } catch (Exception e) {
-                Log.e("Mirror", "❌ 绑定控制器失败", e);
+                Log.e(TAG, "❌ 绑定控制器失败", e);
             }
         }
     };
@@ -482,20 +522,7 @@ public class MyMusicService extends MediaBrowserServiceCompat {
         mSession.setFlags(MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS);
         setSessionToken(mSession.getSessionToken());
 
-        // 恢复上次播放的歌曲信息：让 AA 在真实 token 到来前就能看到有内容，
-        // 避免因初始 STATE_NONE + 无 metadata 而提前显示"无法获享媒体内容"。
-        SharedPreferences lastMeta = getSharedPreferences("last_meta", MODE_PRIVATE);
-        String savedTitle = lastMeta.getString("title", null);
-        String savedArtist = lastMeta.getString("artist", "");
-        if (savedTitle != null) {
-            mSession.setMetadata(new MediaMetadataCompat.Builder()
-                    .putString(MediaMetadataCompat.METADATA_KEY_TITLE, savedTitle)
-                    .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, savedArtist)
-                    .build());
-            Log.i(TAG, "🗃 已恢复上次播放信息: " + savedTitle);
-        }
-        mSession.setPlaybackState(buildMinimalState(
-                PlaybackStateCompat.STATE_PAUSED, 0, 0f));
+        seedInitialSessionContent();
         updateSessionActive("onCreate");
 
         mSession.setCallback(new MediaSessionCompat.Callback() {
@@ -521,67 +548,47 @@ public class MyMusicService extends MediaBrowserServiceCompat {
             }
 
             @Override public void onSeekTo(long positionMs) {
-                if (remoteCtrl != null) {
-                    remoteCtrl.getTransportControls().seekTo(positionMs);
-                }
+                if (remoteCtrl != null) remoteCtrl.getTransportControls().seekTo(positionMs);
 
                 if (!isNcmMode && isLyricsMode) {
                     suppressRemoteState = true;
                     handler.removeCallbacks(clearSuppression);
                     handler.postDelayed(clearSuppression, 1200);
 
-                    long now = SystemClock.elapsedRealtime();
                     PlaybackStateCompat rs = lastRemoteState;
                     baseState = (rs != null) ? rs.getState() : PlaybackStateCompat.STATE_PLAYING;
                     baseSpeed = (rs != null) ? rs.getPlaybackSpeed() : 1.0f;
                     basePosMs = positionMs;
-                    baseUpdateElapsed = now;
+                    baseUpdateElapsed = SystemClock.elapsedRealtime();
 
                     applyLyricsOverlay(lastRemoteMeta);
                 } else {
                     PlaybackStateCompat remoteState =
                             (remoteCtrl != null) ? remoteCtrl.getPlaybackState() : null;
-
-                    if (remoteState != null) {
-                        mSession.setPlaybackState(remoteState);
-                    }
+                    if (remoteState != null) mSession.setPlaybackState(remoteState);
                     updateSessionActive("seekTo");
                 }
             }
 
             @Override
             public void onCustomAction(String action, Bundle extras) {
-                // NCM 模式下直接忽略自定义按钮
-                if (isNcmMode) return;
+                if (isNcmMode) return; // NCM 模式下忽略自定义按钮
 
                 if (CUSTOM_ACTION_SHOW_LYRICS.equals(action)) {
-                    isLyricsMode = !isLyricsMode;
-
                     if (isLyricsMode) {
-                        if (lastRemoteState != null) {
-                            basePosMs = lastRemoteState.getPosition();
-                            baseSpeed = lastRemoteState.getPlaybackSpeed();
-                            baseState = lastRemoteState.getState();
-                            baseUpdateElapsed = SystemClock.elapsedRealtime();
-                        }
-                        handler.post(lyricsUpdater);
-                        applyLyricsOverlay(lastRemoteMeta);
+                        exitLyricsMode();
                     } else {
-                        handler.removeCallbacks(lyricsUpdater);
-                        suppressRemoteState = false;
+                        enterLyricsMode();
                     }
-
                     if (remoteCtrl != null) {
                         mirror(remoteCtrl.getMetadata(), remoteCtrl.getPlaybackState());
                     }
                     updateSessionActive("toggleLyrics=" + isLyricsMode);
 
                 } else if (CUSTOM_ACTION_REPEAT_MODE.equals(action)) {
-                    // 仅 QQ 模式发送 QQ 的切换广播
-                    Intent intent = new Intent("com.tencent.qqmusic.ACTION_SERVICE_PLAY_MODE_WIDGET.QQMusicPhone");
-                    intent.setPackage("com.tencent.qqmusic");
+                    Intent intent = new Intent(QQ_ACTION_PLAY_MODE_WIDGET);
+                    intent.setPackage(PKG_QQMUSIC);
                     sendBroadcast(intent);
-
                     handler.postDelayed(() -> {
                         if (remoteCtrl != null) {
                             mirror(remoteCtrl.getMetadata(), remoteCtrl.getPlaybackState());
@@ -595,31 +602,23 @@ public class MyMusicService extends MediaBrowserServiceCompat {
         LocalBroadcastManager lbm = LocalBroadcastManager.getInstance(this);
         lbm.registerReceiver(tokenRx, new IntentFilter(ACTION_CONTROLLER));
 
+        // 主动唤醒 Sniffer：三星等省电策略下 NotificationListenerService 可能长期处于
+        // 未绑定状态，导致 onGetRoot 发出的 REQUEST_TOKEN 永远没人接。无论 Sniffer 当前
+        // 是否还活着，都让系统重新绑定一次 —— requestRebind 对"从未连接"和"曾经断开"
+        // 都成立，前提是用户授予过通知使用权。
+        requestSnifferRebind();
+
 
 
         // 注册"自动歌词模式"广播
         lbm.registerReceiver(autoLyricsReceiver, new IntentFilter(ACTION_TOGGLE_LYRICS_MODE));
 
-
         // 自动歌词模式：仅在 QQ 模式下可自动开启（NCM 模式忽略）
-        SharedPreferences prefs = getSharedPreferences("settings", MODE_PRIVATE);
-        boolean autoLyrics = prefs.getBoolean("autoLyrics", false);
-        Log.i("Mirror", "🎚 autoLyrics 开关状态 = " + autoLyrics);
+        boolean autoLyrics = getSharedPreferences(SP_SETTINGS, MODE_PRIVATE)
+                .getBoolean("autoLyrics", false);
+        Log.i(TAG, "🎚 autoLyrics = " + autoLyrics);
         if (autoLyrics && !isNcmMode && !isLyricsMode) {
-            isLyricsMode = true;
-
-            if (lastRemoteState != null) {
-                basePosMs = lastRemoteState.getPosition();
-                baseSpeed = lastRemoteState.getPlaybackSpeed();
-                baseState = lastRemoteState.getState();
-                baseUpdateElapsed = SystemClock.elapsedRealtime();
-            }
-
-            handler.post(lyricsUpdater);
-            if (remoteCtrl != null) {
-                applyLyricsOverlay(lastRemoteMeta);
-                mirror(remoteCtrl.getMetadata(), remoteCtrl.getPlaybackState());
-            }
+            enterLyricsMode();
         }
     }
 
@@ -628,20 +627,13 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     // =========================================================
     @Override
     public void onDestroy() {
-        // 取消所有 handler 上的待执行任务（重试 lambda、lyricsUpdater、clearSuppression 等），
-        // 避免服务销毁后 lambda 仍持有 MyMusicService.this 引用导致短暂内存泄漏。
+        // 清掉所有 handler 上的 pending 任务，避免 service 销毁后 lambda 持有 this 引用。
         handler.removeCallbacksAndMessages(null);
-        if (remoteCtrl != null) {
-            remoteCtrl.unregisterCallback(remoteCb);
-        }
-        if (autoStartBrowser != null) {
-            try { autoStartBrowser.disconnect(); } catch (Throwable ignore) {}
-            autoStartBrowser = null;
-        }
+        if (remoteCtrl != null) remoteCtrl.unregisterCallback(remoteCb);
+        disconnectAutoStartBrowser();
         LocalBroadcastManager lbm = LocalBroadcastManager.getInstance(this);
         lbm.unregisterReceiver(tokenRx);
         lbm.unregisterReceiver(autoLyricsReceiver);
-
         mSession.release();
         super.onDestroy();
     }
@@ -653,104 +645,99 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     public BrowserRoot onGetRoot(@NonNull String clientPackageName,
                                  int clientUid,
                                  Bundle rootHints) {
-        // AA 每次 bind（含重连）都会调此方法。
-        // 立即请求 Token，并安排三次重试，覆盖以下竞态：
-        //   • Sniffer 尚未完成 onListenerConnected（初次冷启动）
-        //   • 目标 App 还没打开（自动化脚本延迟启动 QQ 音乐）
-        // 每次重试前检查 remoteCtrl，已拿到 token 则跳过。
-        final LocalBroadcastManager lbm = LocalBroadcastManager.getInstance(this);
-        lbm.sendBroadcast(new Intent("com.nuomi.REQUEST_TOKEN"));
-
-        long[] retryDelaysMs = {1500L, 4000L, 9000L};
-        for (long d : retryDelaysMs) {
-            final long delay = d;
-            handler.postDelayed(() -> {
-                if (remoteCtrl == null) {
-                    Log.i(TAG, "🔁 重试请求 Token（delay=" + delay + "ms）");
-                    lbm.sendBroadcast(new Intent("com.nuomi.REQUEST_TOKEN"));
-                }
-            }, delay);
-        }
-
-        // 若当前没有 remoteCtrl，尝试在后台唤醒上次选中的媒体 App 并触发播放，
-        // 全程无 Activity、无前台界面，不影响手机当前屏幕。
-        if (remoteCtrl == null) {
-            autoStartLastApp();
-        }
-
+        // AA 每次 bind / 重连都会调此方法 —— 重启 60s 发现循环。
+        startDiscovery();
+        // 拿不到 token 时再试着在后台 bind 目标 App 的 MediaBrowserService 触发 play()。
+        if (remoteCtrl == null) autoStartLastApp();
         return new BrowserRoot("root", null);
     }
 
-    // 用来连接目标 App 的 MediaBrowserService（仅后台 Service，无 UI）
-    private MediaBrowserCompat autoStartBrowser;
-
     private void autoStartLastApp() {
-        String pkg = getSharedPreferences("session_pref", MODE_PRIVATE)
-                .getString("last_pkg", null);
+        autoStartAttempts = 0;
+        autoStartLastAppOnce();
+    }
+
+    private void autoStartLastAppOnce() {
+        String pkg = readChosenPkg();
         if (pkg == null) {
             Log.i(TAG, "autoStart: 未选中任何 App，跳过");
             return;
         }
 
-        // 查找目标 App 对外暴露的 MediaBrowserService 组件
-        Intent query = new Intent("android.media.browse.MediaBrowserService");
-        query.setPackage(pkg);
-        List<android.content.pm.ResolveInfo> services;
-        try {
-            services = getPackageManager().queryIntentServices(query, 0);
-        } catch (Exception e) {
-            Log.w(TAG, "autoStart: 查询服务失败 pkg=" + pkg, e);
-            return;
-        }
-        if (services == null || services.isEmpty()) {
-            Log.w(TAG, "autoStart: " + pkg + " 未暴露 MediaBrowserService，跳过");
-            return;
-        }
-
-        ComponentName cn = new ComponentName(
-                services.get(0).serviceInfo.packageName,
-                services.get(0).serviceInfo.name);
+        ComponentName cn = resolveMediaBrowserService(pkg);
+        if (cn == null) return;
         Log.i(TAG, "autoStart: 连接 " + cn.flattenToShortString());
 
-        if (autoStartBrowser != null) {
-            try { autoStartBrowser.disconnect(); } catch (Throwable ignore) {}
-            autoStartBrowser = null;
-        }
-
+        disconnectAutoStartBrowser();
         autoStartBrowser = new MediaBrowserCompat(this, cn,
                 new MediaBrowserCompat.ConnectionCallback() {
                     @Override public void onConnected() {
                         Log.i(TAG, "autoStart: 已连接，发送 play()");
                         try {
-                            MediaControllerCompat ctrl = new MediaControllerCompat(
-                                    MyMusicService.this, autoStartBrowser.getSessionToken());
-                            ctrl.getTransportControls().play();
+                            new MediaControllerCompat(MyMusicService.this,
+                                    autoStartBrowser.getSessionToken())
+                                    .getTransportControls().play();
                         } catch (Exception e) {
                             Log.w(TAG, "autoStart: play() 失败", e);
                         }
                         // play() 触发后 Sniffer 会接管，3 秒后断开自动连接
-                        handler.postDelayed(() -> {
-                            if (autoStartBrowser != null) {
-                                autoStartBrowser.disconnect();
-                                autoStartBrowser = null;
-                            }
-                        }, 3000);
+                        handler.postDelayed(MyMusicService.this::disconnectAutoStartBrowser, 3000);
                     }
                     @Override public void onConnectionFailed() {
-                        Log.w(TAG, "autoStart: 连接失败 pkg=" + pkg);
+                        Log.w(TAG, "autoStart: 连接失败 pkg=" + pkg + " attempt=" + autoStartAttempts);
                         autoStartBrowser = null;
+                        scheduleAutoStartRetry();
                     }
                     @Override public void onConnectionSuspended() {
+                        Log.w(TAG, "autoStart: 连接挂起 pkg=" + pkg + " attempt=" + autoStartAttempts);
                         autoStartBrowser = null;
+                        scheduleAutoStartRetry();
                     }
                 }, null);
 
         autoStartBrowser.connect();
+        autoStartAttempts++;
+    }
+
+    private ComponentName resolveMediaBrowserService(String pkg) {
+        Intent query = new Intent(MEDIA_BROWSER_SERVICE_ACTION).setPackage(pkg);
+        List<ResolveInfo> services;
+        try {
+            services = getPackageManager().queryIntentServices(query, 0);
+        } catch (Exception e) {
+            Log.w(TAG, "autoStart: 查询服务失败 pkg=" + pkg, e);
+            return null;
+        }
+        if (services == null || services.isEmpty()) {
+            Log.w(TAG, "autoStart: " + pkg + " 未暴露 MediaBrowserService，跳过");
+            return null;
+        }
+        return new ComponentName(services.get(0).serviceInfo.packageName,
+                services.get(0).serviceInfo.name);
+    }
+
+    private void disconnectAutoStartBrowser() {
+        if (autoStartBrowser == null) return;
+        try { autoStartBrowser.disconnect(); } catch (Throwable ignore) {}
+        autoStartBrowser = null;
+    }
+
+    private void scheduleAutoStartRetry() {
+        if (remoteCtrl != null) return;
+        if (autoStartAttempts >= AUTO_START_MAX_ATTEMPTS) {
+            Log.i(TAG, "autoStart: 已达最大重试次数，放弃");
+            return;
+        }
+        handler.postDelayed(() -> {
+            if (remoteCtrl == null) autoStartLastAppOnce();
+        }, AUTO_START_RETRY_DELAY_MS);
     }
 
     @Override
     public void onLoadChildren(@NonNull String parentId,
                                @NonNull Result<List<MediaBrowserCompat.MediaItem>> result) {
+        // AA 每次重新查浏览树时也是个"我还在等内容"信号 —— 重启发现循环窗口。
+        if (remoteCtrl == null) startDiscovery();
         result.sendResult(Collections.emptyList());
     }
 }

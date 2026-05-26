@@ -499,6 +499,25 @@ public class MainActivity extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
         refreshOpenButtonLabel(findViewById(R.id.btn_open_app));
+        // 关键路径：Bixby 把糯米拉到前台是用户用来"救场"的核心动作。
+        // 此时 AA 可能正在等 token，主动同时做三件事：
+        //   1. 让系统强行重绑 Sniffer（解决三星 NLS 长期未绑定的情况）
+        //   2. 立即广播一次 REQUEST_TOKEN（如果 Sniffer 已经活了，立即响应）
+        //   3. 锁屏后解锁、刚切到前台时，进程不会被电池策略卡住
+        kickDiscovery();
+    }
+
+    private void kickDiscovery() {
+        try {
+            ComponentName cn = new ComponentName(getPackageName(),
+                    MusicSessionSniffer.class.getName());
+            android.service.notification.NotificationListenerService.requestRebind(cn);
+            Log.i("QqSniffer", "🛎 MainActivity 触发 Sniffer 重绑");
+        } catch (Throwable t) {
+            Log.w("QqSniffer", "requestRebind 失败: " + t.getMessage());
+        }
+        LocalBroadcastManager.getInstance(this)
+                .sendBroadcast(new Intent("com.nuomi.REQUEST_TOKEN"));
     }
 
 
