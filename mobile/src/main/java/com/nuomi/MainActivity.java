@@ -227,6 +227,12 @@ public class MainActivity extends AppCompatActivity {
 
         Button btnOpen = findViewById(R.id.btn_open_app);
 
+        // toolbar 左上的下拉图标改成功能菜单（日志 / 后台保活）
+        com.google.android.material.appbar.MaterialToolbar toolbar = findViewById(R.id.playerToolbar);
+        if (toolbar != null) {
+            toolbar.setNavigationOnClickListener(this::showOptionsMenu);
+        }
+
         // 沉浸式状态栏处理
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main),
                 (v, insets) -> {
@@ -345,12 +351,47 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+    }
 
+    // =========================================================
+    // 左上下拉菜单：日志 / 后台保活
+    // =========================================================
+    private void showOptionsMenu(View anchor) {
+        android.widget.PopupMenu pm = new android.widget.PopupMenu(this, anchor);
+        pm.inflate(R.menu.main_options);
+        boolean keepAlive = getSharedPreferences("settings", MODE_PRIVATE)
+                .getBoolean(com.nuomi.shared.MyMusicService.SETTING_KEEP_ALIVE, false);
+        android.view.MenuItem keepAliveItem = pm.getMenu().findItem(R.id.menu_keep_alive);
+        keepAliveItem.setTitle("后台保活: " + (keepAlive ? "开" : "关"));
+        pm.setOnMenuItemClickListener(item -> {
+            int id = item.getItemId();
+            if (id == R.id.menu_log) {
+                startActivity(new Intent(this, LogViewerActivity.class));
+                return true;
+            }
+            if (id == R.id.menu_keep_alive) {
+                toggleKeepAlive(!keepAlive);
+                return true;
+            }
+            return false;
+        });
+        pm.show();
+    }
 
-
-
-
-
+    private void toggleKeepAlive(boolean enable) {
+        // 偏好由 MyMusicService 在 onStartCommand 里落盘，避免双写不一致；
+        // 这里只发 intent，service 端权威处理。
+        Intent svc = new Intent(this, com.nuomi.shared.MyMusicService.class)
+                .setAction(enable
+                        ? com.nuomi.shared.MyMusicService.ACTION_KEEP_ALIVE_START
+                        : com.nuomi.shared.MyMusicService.ACTION_KEEP_ALIVE_STOP);
+        if (enable) {
+            androidx.core.content.ContextCompat.startForegroundService(this, svc);
+        } else {
+            startService(svc);
+        }
+        Toast.makeText(this, enable ? "已开启后台保活" : "已关闭后台保活",
+                Toast.LENGTH_SHORT).show();
     }
 
     @Override

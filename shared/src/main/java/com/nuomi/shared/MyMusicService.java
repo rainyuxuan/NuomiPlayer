@@ -1,5 +1,6 @@
 package com.nuomi.shared;
 
+import android.app.Notification;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
@@ -10,6 +11,7 @@ import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.IBinder;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.service.notification.NotificationListenerService;
@@ -22,8 +24,10 @@ import android.util.Log;
 import android.util.Pair;
 
 import androidx.annotation.NonNull;
+import androidx.core.app.NotificationCompat;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 import androidx.media.MediaBrowserServiceCompat;
+import androidx.media.app.NotificationCompat.MediaStyle;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -43,6 +47,9 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     private static final String ACTION_CONTROLLER = "com.nuomi.ACTION_CONTROLLER";
     private static final String ACTION_REQUEST_TOKEN = "com.nuomi.REQUEST_TOKEN";
     private static final String ACTION_TOGGLE_LYRICS_MODE = "com.nuomi.ACTION_TOGGLE_LYRICS_MODE";
+    public static final String ACTION_KEEP_ALIVE_START = "com.nuomi.KEEP_ALIVE_START";
+    public static final String ACTION_KEEP_ALIVE_STOP = "com.nuomi.KEEP_ALIVE_STOP";
+    public static final String SETTING_KEEP_ALIVE = "keepForegroundAlive";
 
     private static final String PKG_QQMUSIC = "com.tencent.qqmusic";
     private static final String QQ_ACTION_PLAY_MODE_WIDGET =
@@ -92,6 +99,16 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     private MediaBrowserCompat autoStartBrowser;
     private int autoStartAttempts = 0;
 
+    // 路径 B PoC：在 autoStart 连接成功后，旁路构造一个 MediaController 注册回调，
+    // 观察直接从 MediaBrowserService 拿的 SessionToken 是否能收到 metadata / state。
+    // 用于评估是否可去掉 NotificationListener 主路径。日志-only，不改主流程行为。
+    private static final String PATH_B_TAG = "PathB";
+    private static final long PATH_B_OBSERVE_DURATION_MS = 12_000L;
+    private MediaControllerCompat probeCtrl;
+    private MediaControllerCompat.Callback probeCb;
+    private boolean probeSawMetadata = false;
+    private boolean probeSawState = false;
+
     private static final String TAG = "Mirror";
 
     // mobile 模块里的 Sniffer 组件名（shared 不能直接引用 mobile 类，硬编码字符串避免循环依赖）
@@ -99,6 +116,14 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     private static final String MEDIA_BROWSER_SERVICE_ACTION = "android.media.browse.MediaBrowserService";
     private static final int AUTO_START_MAX_ATTEMPTS = 3;
     private static final long AUTO_START_RETRY_DELAY_MS = 2000L;
+
+    // 前台 Service 相关：在 AA bind 期间显示一个 MIN 优先级通知，让进程在 AA 重连之间保持存活。
+    private static final String FG_CHANNEL_ID = "nuomi.aa.fg";
+    private static final int FG_NOTIFICATION_ID = 1042;
+    private int boundClientCount = 0;
+    private boolean inForeground = false;
+    // keep-alive：用户手动开启后，service 一直前台，不随 AA bind/unbind 变化。
+    private boolean keepAliveEnabled = false;
 
     // ===== 发现循环（AA bind 后用来持续请求 token） =====
     // AA bind 与目标 App / NLS 绑定可能有数十秒延迟。
@@ -201,6 +226,31 @@ public class MyMusicService extends MediaBrowserServiceCompat {
                 CUSTOM_ACTION_SHOW_LYRICS, "歌词", lyricsIconRes).build());
         builder.addCustomAction(new PlaybackStateCompat.CustomAction.Builder(
                 CUSTOM_ACTION_REPEAT_MODE, "循环", resolveRepeatIcon(playMode)).build());
+    }
+
+    /**
+     * 乐观更新 session 的 PlaybackState：用户按下 play/pause 后立刻反映新状态，
+     * 不等 remoteCtrl 的真实回调（通常有 100~300ms 延迟）。真实状态到达后会被
+     * RemoteCallback 校正覆盖。歌词模式下还要同步 base 时钟，否则下一帧 overlay
+     * 会用旧 baseState 渲染。
+     */
+    private void optimisticPlaybackState(int state) {
+        float speed = state == PlaybackStateCompat.STATE_PLAYING ? 1.0f : 0f;
+        if (!isNcmMode && isLyricsMode) {
+            baseState = state;
+            baseSpeed = speed;
+            baseUpdateElapsed = SystemClock.elapsedRealtime();
+            lastLyricsIdx = -1;
+            applyLyricsOverlay(lastRemoteMeta);
+            return;
+        }
+        PlaybackStateCompat current = mSession.getController().getPlaybackState();
+        long pos = (current != null) ? current.getPosition() : 0L;
+        PlaybackStateCompat.Builder b = new PlaybackStateCompat.Builder()
+                .setState(state, pos, speed, SystemClock.elapsedRealtime())
+                .setActions(STANDARD_ACTIONS);
+        if (!isNcmMode) addQqCustomActions(b, lastPlayMode);
+        mSession.setPlaybackState(b.build());
     }
 
     /** 用 lastRemoteState 把"基准位置/速度/状态/时钟"快照对齐，供 clockPosition() 推算。 */
@@ -520,8 +570,41 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     // 🚀 启动服务：初始化本地 MediaSession 并设置转发逻辑
     // =========================================================
     @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        String action = (intent != null) ? intent.getAction() : null;
+        if (ACTION_KEEP_ALIVE_START.equals(action)) {
+            keepAliveEnabled = true;
+            getSharedPreferences(SP_SETTINGS, MODE_PRIVATE).edit()
+                    .putBoolean(SETTING_KEEP_ALIVE, true).apply();
+            enterForegroundIfNeeded();
+            Log.i(TAG, "🟢 keep-alive 启用");
+            return START_STICKY;
+        }
+        if (ACTION_KEEP_ALIVE_STOP.equals(action)) {
+            keepAliveEnabled = false;
+            getSharedPreferences(SP_SETTINGS, MODE_PRIVATE).edit()
+                    .putBoolean(SETTING_KEEP_ALIVE, false).apply();
+            Log.i(TAG, "⚪ keep-alive 关闭");
+            if (boundClientCount == 0) {
+                exitForeground();
+                stopSelf();
+            }
+            return START_NOT_STICKY;
+        }
+        // 系统因 START_STICKY 重启时 intent==null：从 pref 恢复 keep-alive 态
+        if (intent == null && keepAliveEnabled) {
+            enterForegroundIfNeeded();
+        }
+        return super.onStartCommand(intent, flags, startId);
+    }
+
+    @Override
     public void onCreate() {
         super.onCreate();
+
+        // 读 keep-alive 偏好，决定是否需要在 onCreate 末尾自动进入前台
+        keepAliveEnabled = getSharedPreferences(SP_SETTINGS, MODE_PRIVATE)
+                .getBoolean(SETTING_KEEP_ALIVE, false);
 
         mSession = new MediaSessionCompat(this, "MirrorSession");
         mSession.setFlags(MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS);
@@ -533,13 +616,15 @@ public class MyMusicService extends MediaBrowserServiceCompat {
         mSession.setCallback(new MediaSessionCompat.Callback() {
 
             @Override public void onPlay() {
-                if (remoteCtrl != null)
-                    remoteCtrl.getTransportControls().play();
+                if (remoteCtrl == null) return;
+                optimisticPlaybackState(PlaybackStateCompat.STATE_PLAYING);
+                remoteCtrl.getTransportControls().play();
             }
 
             @Override public void onPause() {
-                if (remoteCtrl != null)
-                    remoteCtrl.getTransportControls().pause();
+                if (remoteCtrl == null) return;
+                optimisticPlaybackState(PlaybackStateCompat.STATE_PAUSED);
+                remoteCtrl.getTransportControls().pause();
             }
 
             @Override public void onSkipToNext() {
@@ -625,6 +710,9 @@ public class MyMusicService extends MediaBrowserServiceCompat {
         if (autoLyrics && !isNcmMode && !isLyricsMode) {
             enterLyricsMode();
         }
+
+        // keep-alive 模式：进程刚起来就提到前台，不等 AA bind
+        if (keepAliveEnabled) enterForegroundIfNeeded();
     }
 
     // =========================================================
@@ -632,10 +720,12 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     // =========================================================
     @Override
     public void onDestroy() {
+        exitForeground();
         // 清掉所有 handler 上的 pending 任务，避免 service 销毁后 lambda 持有 this 引用。
         handler.removeCallbacksAndMessages(null);
         if (remoteCtrl != null) remoteCtrl.unregisterCallback(remoteCb);
         disconnectAutoStartBrowser();
+        unregisterProbeObserver();
         LocalBroadcastManager lbm = LocalBroadcastManager.getInstance(this);
         lbm.unregisterReceiver(tokenRx);
         lbm.unregisterReceiver(autoLyricsReceiver);
@@ -646,6 +736,80 @@ public class MyMusicService extends MediaBrowserServiceCompat {
     // =========================================================
     // 🚪 MediaBrowser 接口（供 Android Auto 探测）
     // =========================================================
+    // =========================================================
+    // 🔌 AA bind 生命周期 → 前台 Service 开关
+    // =========================================================
+    @Override
+    public IBinder onBind(Intent intent) {
+        IBinder binder = super.onBind(intent);
+        boundClientCount++;
+        enterForegroundIfNeeded();
+        return binder;
+    }
+
+    @Override
+    public boolean onUnbind(Intent intent) {
+        boolean res = super.onUnbind(intent);
+        boundClientCount = Math.max(0, boundClientCount - 1);
+        // keep-alive 开启时不退出前台；只有"无 client 绑定 + 用户未要求保活"才退出
+        if (boundClientCount == 0 && !keepAliveEnabled) exitForeground();
+        return res;
+    }
+
+    private void enterForegroundIfNeeded() {
+        if (inForeground) return;
+        try {
+            ensureNotificationChannel();
+            Notification n = buildForegroundNotification();
+            // Android 10+ 推荐 3-arg 形式；14+ 要求 service 声明 foregroundServiceType 时必须显式传。
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                startForeground(FG_NOTIFICATION_ID, n,
+                        android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+            } else {
+                startForeground(FG_NOTIFICATION_ID, n);
+            }
+            inForeground = true;
+            Log.i(TAG, "▶ enterForeground (boundClients=" + boundClientCount + ")");
+        } catch (Throwable t) {
+            // 启动前台失败不应让 service 崩溃；继续按普通 bound service 运行
+            Log.w(TAG, "enterForeground 失败: " + t.getMessage());
+        }
+    }
+
+    private void exitForeground() {
+        if (!inForeground) return;
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE);
+            inForeground = false;
+            Log.i(TAG, "⏹ exitForeground");
+        } catch (Throwable t) {
+            Log.w(TAG, "exitForeground 失败: " + t.getMessage());
+        }
+    }
+
+    private void ensureNotificationChannel() {
+        android.app.NotificationManager nm = getSystemService(android.app.NotificationManager.class);
+        if (nm == null || nm.getNotificationChannel(FG_CHANNEL_ID) != null) return;
+        android.app.NotificationChannel ch = new android.app.NotificationChannel(
+                FG_CHANNEL_ID, "车机模式", android.app.NotificationManager.IMPORTANCE_LOW);
+        ch.setDescription("Android Auto 连接期间保持运行");
+        ch.setShowBadge(false);
+        nm.createNotificationChannel(ch);
+    }
+
+    private Notification buildForegroundNotification() {
+        return new NotificationCompat.Builder(this, FG_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_media_play)
+                .setContentTitle("糯米播放器")
+                .setContentText("车机模式运行中")
+                .setPriority(NotificationCompat.PRIORITY_MIN)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setOnlyAlertOnce(true)
+                .setShowWhen(false)
+                .setStyle(new MediaStyle().setMediaSession(mSession.getSessionToken()))
+                .build();
+    }
+
     @Override
     public BrowserRoot onGetRoot(@NonNull String clientPackageName,
                                  int clientUid,
@@ -678,15 +842,19 @@ public class MyMusicService extends MediaBrowserServiceCompat {
                 new MediaBrowserCompat.ConnectionCallback() {
                     @Override public void onConnected() {
                         Log.i(TAG, "autoStart: 已连接，发送 play()");
+                        MediaSessionCompat.Token token = autoStartBrowser.getSessionToken();
                         try {
-                            new MediaControllerCompat(MyMusicService.this,
-                                    autoStartBrowser.getSessionToken())
+                            new MediaControllerCompat(MyMusicService.this, token)
                                     .getTransportControls().play();
                         } catch (Exception e) {
                             Log.w(TAG, "autoStart: play() 失败", e);
                         }
-                        // play() 触发后 Sniffer 会接管，3 秒后断开自动连接
-                        handler.postDelayed(MyMusicService.this::disconnectAutoStartBrowser, 3000);
+                        // 路径 B 观察：注册一个临时 callback，看从 MediaBrowserService 直接拿的
+                        // SessionToken 是否真能持续收到 metadata / playback state。
+                        startPathBObservation(token, pkg);
+                        // play() 触发后 Sniffer 会接管，留出观察窗口后再断开
+                        handler.postDelayed(MyMusicService.this::disconnectAutoStartBrowser,
+                                PATH_B_OBSERVE_DURATION_MS);
                     }
                     @Override public void onConnectionFailed() {
                         Log.w(TAG, "autoStart: 连接失败 pkg=" + pkg + " attempt=" + autoStartAttempts);
@@ -725,6 +893,55 @@ public class MyMusicService extends MediaBrowserServiceCompat {
         if (autoStartBrowser == null) return;
         try { autoStartBrowser.disconnect(); } catch (Throwable ignore) {}
         autoStartBrowser = null;
+        unregisterProbeObserver();
+    }
+
+    // ===== 路径 B 观察 =====
+
+    private void startPathBObservation(MediaSessionCompat.Token token, String pkg) {
+        unregisterProbeObserver();
+        probeSawMetadata = false;
+        probeSawState = false;
+        try {
+            probeCtrl = new MediaControllerCompat(this, token);
+            probeCb = new MediaControllerCompat.Callback() {
+                @Override public void onMetadataChanged(MediaMetadataCompat m) {
+                    probeSawMetadata = true;
+                    String title = (m != null) ? m.getString(MediaMetadataCompat.METADATA_KEY_TITLE) : null;
+                    Log.i(PATH_B_TAG, "✅ metadata via MediaBrowserService token pkg=" + pkg
+                            + " title=" + title);
+                }
+                @Override public void onPlaybackStateChanged(PlaybackStateCompat s) {
+                    probeSawState = true;
+                    Log.i(PATH_B_TAG, "✅ state via MediaBrowserService token pkg=" + pkg
+                            + " state=" + (s != null ? s.getState() : "null"));
+                }
+            };
+            probeCtrl.registerCallback(probeCb);
+            // 立即取一次当前快照，看 token 是否带初始内容
+            MediaMetadataCompat initMeta = probeCtrl.getMetadata();
+            PlaybackStateCompat initState = probeCtrl.getPlaybackState();
+            Log.i(PATH_B_TAG, "🔬 注册观察 pkg=" + pkg
+                    + " initMeta=" + (initMeta != null)
+                    + " initState=" + (initState != null ? initState.getState() : "null"));
+            // 观察窗口结束后汇总结论
+            handler.postDelayed(this::summarizePathB, PATH_B_OBSERVE_DURATION_MS);
+        } catch (Throwable t) {
+            Log.w(PATH_B_TAG, "观察初始化失败: " + t.getMessage());
+        }
+    }
+
+    private void summarizePathB() {
+        Log.i(PATH_B_TAG, "📊 观察窗口结束: sawMetadata=" + probeSawMetadata
+                + " sawState=" + probeSawState);
+    }
+
+    private void unregisterProbeObserver() {
+        if (probeCtrl != null && probeCb != null) {
+            try { probeCtrl.unregisterCallback(probeCb); } catch (Throwable ignore) {}
+        }
+        probeCtrl = null;
+        probeCb = null;
     }
 
     private void scheduleAutoStartRetry() {

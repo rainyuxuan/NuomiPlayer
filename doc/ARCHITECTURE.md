@@ -46,6 +46,7 @@
 | `MainActivity` | mobile | 设置入口、歌词开关、当前歌曲展示；前台时主动唤起发现链路 |
 | `SessionPickerSheet` | mobile | 让用户选要镜像的 App，写入 `session_pref.last_pkg` |
 | `SessionSnifferService` | mobile | 第二个 NLS，仅供 picker UI 列举活跃 session |
+| `BootReceiver` | mobile | 开机 / 应用更新后请求重绑 Sniffer，前移 NLS 绑定时机 |
 | `PlaybackControlsFragment` / `AlbumCoverFragment` | mobile | 手机端 UI 渲染 |
 
 ## 2. 进程内信道
@@ -64,15 +65,24 @@
 ### 3.1 总体时序
 
 ```
-T0   AA 探测 → bind MyMusicService → onCreate()
-        ├─ 注册 tokenRx
-        ├─ 设占位 metadata（恢复 last_meta 或 "糯米播放器/等待音乐源…"）
-        ├─ setSessionToken / setActive(true)
-        └─ requestSnifferRebind()              ← 主动唤起 NLS
+T-∞  开机 / 应用更新 → BootReceiver.onReceive
+        └─ requestSnifferRebind()              ← 让 NLS 在插车前就连上
+
+T0   AA 探测 → bindService(MyMusicService)
+        ├─ MyMusicService.onCreate()
+        │     ├─ 注册 tokenRx
+        │     ├─ seedInitialSessionContent  (占位 metadata + PAUSED)
+        │     ├─ setSessionToken / setActive(true)
+        │     └─ requestSnifferRebind()
+        └─ MyMusicService.onBind()  ← boundClientCount++
+              └─ enterForegroundIfNeeded()  ← MIN 优先级通知 + MediaStyle
 
 T1   AA 调用 onGetRoot()
         ├─ startDiscovery()  ← 启动 60s 发现循环
         └─ if remoteCtrl==null: autoStartLastApp()
+              ├─ bind 目标 App 的 MediaBrowserService
+              ├─ onConnected: play()
+              └─ startPathBObservation()  ← PoC，观察 token 是否带 metadata/state
 
 T2   discovery tick (0.5s, 1, 2, 4, 8, 8…)
         ├─ broadcast REQUEST_TOKEN
@@ -90,8 +100,12 @@ T5   MyMusicService.tokenRx 收到
         ├─ switchModeForSource(pkg) → 切换 QQ / NCM 分支
         ├─ 构造 remoteCtrl，注册 RemoteCallback
         ├─ stopDiscovery("got-token")  ← 停掉所有 pending 工作
-        ├─ disconnectAutoStartBrowser()
+        ├─ disconnectAutoStartBrowser() （连带停掉 PathB 观察）
         └─ mirror(meta, state) → AA 屏幕显示真实歌曲
+
+T∞   AA 断开 → MyMusicService.onUnbind()  ← boundClientCount==0
+        └─ exitForeground()  ← 通知移除，进程进入普通后台态
+              (前台 Service 期间进程未被回收，下次 AA 重连零冷启动)
 ```
 
 ### 3.2 发现循环（onGetRoot 之后）
@@ -133,15 +147,54 @@ autoStartLastApp:
 
 ### 3.4 Sniffer 唤醒策略
 
-NLS 绑定状态由系统决定，存在"长期未绑定"的可能性。本应用通过三处主动唤醒：
+NLS 绑定状态由系统决定，存在"长期未绑定"的可能性。本应用通过四处主动唤醒：
 
 | 触发点 | 调用方 | 时机 |
 |--------|--------|------|
+| BootReceiver | 开机 / 应用更新 | 把 NLS 绑定时机前移到 boot 时段 |
 | MyMusicService.onCreate | MediaBrowserService 启动后 | AA bind 时 |
 | discovery tick (前 3 次) | MyMusicService.discoveryTick | AA 等 token 期间 |
-| MainActivity.onResume | Activity 切入前台 | 用户打开 UI / 自动化触发 |
+| MainActivity.onResume | Activity 切入前台 | 用户打开 UI |
 
 任一通道生效，Sniffer 即可绑定并发送 token。
+
+### 3.5 前台 Service 生命周期
+
+为避免 AA 断开后进程被回收、下次重连重走整个冷启动链路，MyMusicService 在被 bind 期间提升为前台 Service：
+
+```
+onBind:    boundClientCount++  → enterForegroundIfNeeded()
+onUnbind:  boundClientCount--  → if 0: exitForeground()
+```
+
+- 通知通道 `nuomi.aa.fg`：IMPORTANCE_LOW，无声、无角标
+- 通知样式：`MediaStyle.setMediaSession(token)`，系统会从 session 自动拉歌曲信息
+- 优先级 MIN + VISIBILITY_PUBLIC：尽量不打扰，但锁屏可见用于控件交互
+- API 29+ 使用 3-arg `startForeground(id, n, FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)` 满足 Android 14+ 要求
+- 失败回退：startForeground 抛异常不会让 service 崩溃，退化为普通 bound service
+
+### 3.6 路径 B 观察（PoC，log-only）
+
+主路径走 NotificationListenerService 拿 token。理论上还有路径 B：直接 `bind` 目标 App 的 `MediaBrowserService`，`getSessionToken` 得到 token 后构造 `MediaControllerCompat` 观察。`autoStartLastAppOnce` 已经 bind 了一次，这里仅旁路注册一个临时回调验证：
+
+```
+startPathBObservation:
+    probeCtrl = new MediaControllerCompat(this, autoStartBrowser.getSessionToken())
+    probeCtrl.registerCallback {
+        onMetadataChanged → Log.i(PathB, ...)
+        onPlaybackStateChanged → Log.i(PathB, ...)
+    }
+    handler.postDelayed(summarizePathB, 12s)
+
+12s 后或 autoStart disconnect 时：unregisterProbeObserver()
+```
+
+观察目标：
+- `getSessionToken()` 拿到的 session 是否带 metadata（标题/封面）
+- 是否能持续收到 state 变化（说明它是"真正在播的那个" session）
+- 不同 App 版本下的兼容性
+
+logcat 过滤 tag `PathB` 即可看到。**主流程行为不受影响。**
 
 ## 4. 关键流程：QQ 歌词模式
 
@@ -212,6 +265,8 @@ mirror(meta, st):
 | `lastLyricsIdx` | int | 上次写入的歌词行号；用于跨 tick 去重 |
 | `discoveryRunning` / `discoveryTickCount` | 控制 | 发现循环状态 |
 | `autoStartAttempts` | int | autoStart 已尝试次数（上限 3） |
+| `boundClientCount` / `inForeground` | 控制 | 前台 Service 生命周期 |
+| `probeCtrl` / `probeCb` / `probeSawMetadata` / `probeSawState` | 调试 | 路径 B 观察用临时 controller 与命中标记 |
 
 ## 6. 可调参数（MyMusicService）
 
@@ -223,6 +278,8 @@ mirror(meta, st):
 | `DISCOVERY_REBIND_TICK_LIMIT` | 3 | 仅前 N 次 tick 触发 requestRebind |
 | `AUTO_START_MAX_ATTEMPTS` | 3 | autoStart 重试次数 |
 | `AUTO_START_RETRY_DELAY_MS` | 2000 | autoStart 重试间隔 |
+| `PATH_B_OBSERVE_DURATION_MS` | 12000 | 路径 B 观察窗口 |
+| `FG_CHANNEL_ID` / `FG_NOTIFICATION_ID` | 字符串 / 1042 | 前台通知 ID |
 
 Sniffer 端：
 
@@ -242,11 +299,11 @@ Sniffer 端：
 
 ## 8. 已知限制
 
-1. **NLS 绑定不可强制**：`requestRebind` 是请求而非命令，系统可拒绝。本应用在三处主动调用以提高命中率，但不保证。
+1. **NLS 绑定不可强制**：`requestRebind` 是请求而非命令，系统可拒绝。本应用在四处主动调用以提高命中率，但不保证。
 2. **后台 Activity 启动受限**（Android 12+）：不能从车机端直接把目标 App 的 UI 拉到前台。autoStart 仅依赖目标 App 的 MediaBrowserService。
 3. **目标 App 的 MediaBrowserService 不一定对外公开**：若需鉴权，autoStart 会失败，需要用户在手机端手动操作目标 App。
 4. **NLS 权限须用户开启**：未开启时 `getActiveSessions` 抛 SecurityException，所有发现逻辑失效；MainActivity 启动时会弹窗引导。
-5. **锁屏下首次冷启动**：`MediaBrowserService` 仍可绑定，但 NLS 绑定可能延迟数秒到数十秒；发现循环的 60s 窗口与延迟重查通常足以覆盖。
+5. **未解锁开机 + 直接插车**：FBE 锁定阶段 NLS 不会绑定，`SharedPreferences` 也读不到。BootReceiver 自身仍能触发（`LOCKED_BOOT_COMPLETED` 已注册），但 NLS 实际生效仍要等首次解锁。
 
 ## 9. 性能特征
 
@@ -255,5 +312,20 @@ Sniffer 端：
 | 歌词模式 IPC（setMetadata + setPlaybackState） | ~1 次 / 歌词行（~3~5 秒一行）|
 | 非歌词模式 IPC | 仅 onMetadataChanged / onPlaybackStateChanged 触发，频率随源 App |
 | discovery 期间 IPC | 0.5/1/2/4/8s 退避，60s 上限，约 6~8 次 |
-| requestRebind | 仅 onCreate + onResume + 前 3 个 discovery tick |
+| requestRebind | onCreate + onResume + BootReceiver + 前 3 个 discovery tick |
+| AA 重连冷启动 | 前台 Service 期间为 0；进程被回收后才走完整 onCreate 链路 |
 | MainActivity 在后台 | 不处理 token 广播（onStop 时注销） |
+| onPlay / onPause 响应 | 乐观更新立即 setPlaybackState；实际 IPC 与 transport 命令并发 |
+
+## 10. 本轮已落地的"接近原生"优化
+
+- **前台 Service**（AA bind 生命周期内）：AA 重连零冷启动，进程稳态
+- **BootReceiver**：开机 / 应用更新即触发 Sniffer 重绑，前移 NLS 绑定时机
+- **乐观 PlaybackState**：onPlay/onPause 立即反映新状态，不等远端 100~300ms 延迟
+- **路径 B PoC**：旁路观察直接 bind 目标 App 的 MediaBrowserService 是否能省掉 NLS 主路径（log-only）
+
+仍未做、可作下一步的：
+
+- 路径 B 转主路径（依赖 PoC 验证结果）
+- Direct-Boot-aware MyMusicService（把 last_pkg 挪到 device-protected storage）—— 仅边际收益，NLS 仍需解锁
+- 速度更激进的 BootReceiver 持续重绑（JobScheduler 周期 ping）

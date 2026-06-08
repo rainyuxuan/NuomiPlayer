@@ -4,6 +4,9 @@
 
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
     <!-- Android 11+ 需要声明才能查询其他 App 的 MediaBrowserService，
          用于在 AA 连接时后台唤醒上次选中的媒体 App。 -->
@@ -34,21 +37,40 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".LogViewerActivity"
+            android:exported="false"
+            android:label="日志" />
+
         <meta-data
             android:name="com.google.android.gms.car.application"
             android:resource="@xml/automotive_app_desc" />
 
-        <!-- MediaBrowserService -->
+        <!-- MediaBrowserService。
+             foregroundServiceType=mediaPlayback：AA 连接期间进入前台 Service 保持进程存活，
+             避免 AA 重连时冷启动 + 给 Sniffer 持续连接的更稳态势。 -->
         <service
             android:name="com.nuomi.shared.MyMusicService"
             android:exported="true"
-            android:enabled="true">
+            android:enabled="true"
+            android:foregroundServiceType="mediaPlayback">
 
             <intent-filter>
                 <action android:name="android.media.browse.MediaBrowserService" />
             </intent-filter>
 
         </service>
+
+        <!-- 开机/应用更新后请求 Sniffer 重绑，前移 NLS 绑定延迟。 -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <service
             android:name=".MusicSessionSniffer"
